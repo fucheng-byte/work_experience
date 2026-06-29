@@ -106,12 +106,12 @@ if prompt := st.chat_input("請輸入問題..."):
                 
                 # 組合 Prompt，強制 AI 必須根據知識庫回答
                 full_prompt = (
-                    "你是一個專門分析『技銷金技出差經驗』的 AI 智能助理。\n"
-                    "請嚴格根據以下提供的【出差經驗知識庫】內容來回答使用者的問題。\n"
-                    "如果問題在知識庫中完全找不到線索，請客氣地回答：'抱歉，目前的出差經驗知識庫中沒有記載相關資料。'，並根據你的通用知識給予基本建議。\n\n"
-                    f"【出差經驗知識庫內容】:\n{st.session_state.knowledge_base}\n\n"
-                    f"【使用者問題】: {prompt}"
-                )
+    "你是一個專門分析公司內部資料的 AI 智能助理。\n"
+    "請根據以下提供的【公司知識庫】內容（包含出差經驗、廠商資料等）來回答使用者的問題。\n"
+    "如果問題在知識庫中完全找不到線索，請回答：'抱歉，目前的知識庫中沒有記載相關資料。'，並根據你的通用知識給予基本建議。\n\n"
+    f"【公司知識庫內容】:\n{st.session_state.knowledge_base}\n\n"
+    f"【使用者問題】: {prompt}"
+)
                 
                 response = model.generate_content(full_prompt)
                 ai_reply = response.text
