@@ -1,33 +1,123 @@
+import os
 import streamlit as st
 import google.generativeai as genai
 from pypdf import PdfReader
 
-# 1. 設定 Gemini API 金鑰（這要在 Streamlit Cloud 的 Secrets 設定）
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+# ==========================================
+# 1. 網頁基本設定 (包含您要的新名稱)
+# ==========================================
+st.set_page_config(
+    page_title="技銷金技出差經驗分享", 
+    page_icon="🚀",
+    layout="wide"
+)
 
-# 2. 建立一個讀取 PDF 文字的 function
-def get_pdf_text(pdf_docs):
+st.title("🚀 技銷金技出差經驗分享 (AI + 知識庫)")
+
+# ==========================================
+# 2. 初始化 Gemini AI 金鑰
+# ==========================================
+if "GEMINI_API_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+else:
+    st.error("錯誤：未在 Streamlit 後台設定 GEMINI_API_KEY 金鑰！")
+
+# ==========================================
+# 3. 定義 PDF 文字讀取函式
+# ==========================================
+def extract_text_from_pdf(pdf_file):
+    """讀取單一 PDF 檔案的文字"""
     text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text()
+    try:
+        reader = PdfReader(pdf_file)
+        for page in reader.pages:
+            content = page.extract_text()
+            if content:
+                text += content + "\n"
+    except Exception as e:
+        st.error(f"讀取檔案時發生錯誤: {e}")
     return text
 
-# 3. 網頁側邊欄上傳
+# ==========================================
+# 4. 初始化知識庫與對話紀錄 (Session State)
+# ==========================================
+if "knowledge_base" not in st.session_state:
+    st.session_state.knowledge_base = ""
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# --- 自動載入 GitHub 中 data 資料夾的 PDF 檔案 ---
+if "data_loaded" not in st.session_state:
+    st.session_state.data_loaded = False
+
+if not st.session_state.data_loaded:
+    data_dir = "data"
+    auto_text = ""
+    if os.path.exists(data_dir):
+        pdf_files = [f for f in os.listdir(data_dir) if f.lower().endswith('.pdf')]
+        if pdf_files:
+            for filename in pdf_files:
+                file_path = os.path.join(data_dir, filename)
+                auto_text += extract_text_from_pdf(file_path)
+            st.session_state.knowledge_base += auto_text
+    st.session_state.data_loaded = True
+
+# ==========================================
+# 5. 側邊欄設計 (文件中心)
+# ==========================================
 with st.sidebar:
     st.subheader("文件中心")
-    uploaded_files = st.file_uploader("上傳知識庫 PDF", accept_multiple_files=True, type=['pdf'])
+    st.info("已自動載入 data 資料夾中的檔案")
+    
+    st.subheader("手動額外上傳資料")
+    uploaded_files = st.file_uploader("Upload", accept_multiple_files=True, type=['pdf'])
     
     if uploaded_files:
-        # 讀取 PDF 內容
-        with st.spinner("正在讀取雲端/上傳的文件..."):
-            raw_text = get_pdf_text(uploaded_files)
-            st.success("知識庫載入成功！")
+        with st.spinner("正在讀取上傳的文件..."):
+            uploaded_text = ""
+            for f in uploaded_files:
+                uploaded_text += extract_text_from_pdf(f)
+            # 將新上傳的文字追加到知識庫中
+            st.session_state.knowledge_base += uploaded_text
+            st.success("額外文件載入成功！")
 
-# 4. 當使用者輸入問題時，把 raw_text (知識庫) 跟問題一起餵給 Gemini
+# ==========================================
+# 6. 聊天對話介面
+# ==========================================
+# 顯示歷史對話紀錄
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# 底部聊天輸入框
 if prompt := st.chat_input("請輸入問題..."):
-    # 這裡組合 Prompt（提示詞強化）
-    full_prompt = f"請根據以下知識庫內容回答問題：\n\n【知識庫內容】:\n{raw_text}\n\n【使用者問題】: {prompt}"
-    
-    # 呼叫 Gemini 模型的程式碼...
+    # 顯示使用者的問題
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    st.session_state.messages.append({"role": "user", "content": prompt})
+
+    # 呼叫 Gemini 產生回答
+    with st.chat_message("assistant"):
+        with st.spinner("AI 正在思考中..."):
+            try:
+                # 建立最新的 Gemini 模型 (使用適合大上下文的 1.5-flash)
+                model = genai.GenerativeModel('gemini-1.5-flash')
+                
+                # 組合 Prompt，強制 AI 必須根據知識庫回答
+                full_prompt = (
+                    "你是一個專門分析『技銷金技出差經驗』的 AI 智能助理。\n"
+                    "請嚴格根據以下提供的【出差經驗知識庫】內容來回答使用者的問題。\n"
+                    "如果問題在知識庫中完全找不到線索，請客氣地回答：'抱歉，目前的出差經驗知識庫中沒有記載相關資料。'，並根據你的通用知識給予基本建議。\n\n"
+                    f"【出差經驗知識庫內容】:\n{st.session_state.knowledge_base}\n\n"
+                    f"【使用者問題】: {prompt}"
+                )
+                
+                response = model.generate_content(full_prompt)
+                ai_reply = response.text
+                
+                st.markdown(ai_reply)
+                st.session_state.messages.append({"role": "assistant", "content": ai_reply})
+                
+            except Exception as e:
+                st.error(f"系統呼叫 AI 時發生錯誤，請檢查您的 API Key 是否正確。錯誤訊息: {e}")
