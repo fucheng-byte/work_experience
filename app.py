@@ -101,8 +101,8 @@ if prompt := st.chat_input("請輸入問題..."):
     with st.chat_message("assistant"):
         with st.spinner("AI 正在思考中..."):
             try:
-                # 建立最新的 Gemini 模型 (使用適合大上下文的 1.5-flash)
-                model = genai.GenerativeModel('gemini-1.5-flash')
+                # 建立最新的 Gemini 模型 (使用適合大上下文的 pro)
+                model = genai.GenerativeModel('gemini-pro')
                 
                 # 組合 Prompt，強制 AI 必須根據知識庫回答
                 full_prompt = (
