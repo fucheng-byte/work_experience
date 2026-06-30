@@ -11,6 +11,27 @@ if "GEMINI_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 else:
     st.error("錯誤：未在 Streamlit 後台設定 GEMINI_API_KEY 金鑰！")
+    st.stop()
+
+@st.cache_resource
+def get_best_models():
+    """動態偵測 API 金鑰支援的模型，徹底解決 404 錯誤"""
+    embed_model = "models/embedding-001" # 預設安全牌
+    chat_model = "gemini-1.5-flash"
+    try:
+        available = [m for m in genai.list_models()]
+        embed_models = [m.name for m in available if 'embedContent' in m.supported_generation_methods]
+        if "models/text-embedding-004" in embed_models:
+            embed_model = "models/text-embedding-004"
+        elif "models/embedding-001" in embed_models:
+            embed_model = "models/embedding-001"
+        elif embed_models:
+            embed_model = embed_models[0]
+    except Exception:
+        pass
+    return embed_model, chat_model
+
+EMBED_MODEL, CHAT_MODEL = get_best_models()
 
 def extract_text_from_pdf(pdf_file):
     text = ""
@@ -20,7 +41,7 @@ def extract_text_from_pdf(pdf_file):
             content = page.extract_text()
             if content:
                 text += content + "\n"
-    except Exception as e:
+    except Exception:
         pass
     return text
 
@@ -82,22 +103,25 @@ def build_knowledge_base(data_dir, mod_time):
     for i in range(0, len(texts_to_embed), batch_size):
         batch = texts_to_embed[i:i+batch_size]
         try:
-            res = genai.embed_content(model="models/text-embedding-004", content=batch)
+            res = genai.embed_content(model=EMBED_MODEL, content=batch)
             embeddings.extend(res['embedding'])
         except Exception as e:
-            pass
+            # 遇到錯誤時填補空向量，避免資料錯位
+            for _ in batch:
+                embeddings.append([0.0]*768)
             
     for chunk, emb in zip(all_chunks, embeddings):
-        chunk["embedding"] = emb
-        database.append(chunk)
-        
+        if any(v != 0.0 for v in emb): # 只儲存成功轉換的段落
+            chunk["embedding"] = emb
+            database.append(chunk)
+            
     return database
 
 data_dir = "data"
 current_mod_time = get_dir_mod_time(data_dir)
 
 if "db_initialized" not in st.session_state:
-    with st.spinner("🔄 正在初始化企業級知識庫（正在為近 200 份文件建立高階檢索索引，請稍候...）"):
+    with st.spinner("🔄 正在初始化企業級知識庫（正在為近 200 份文件建立高階檢索索引，這可能需要幾分鐘，請耐心等候...）"):
         st.session_state.vector_db = build_knowledge_base(data_dir, current_mod_time)
         st.session_state.db_initialized = True
 else:
@@ -110,8 +134,12 @@ if "messages" not in st.session_state:
 with st.sidebar:
     st.subheader("📁 文件中心")
     file_count = len([f for f in os.listdir(data_dir) if f.lower().endswith('.pdf')]) if os.path.exists(data_dir) else 0
-    st.success(f"✅ 系統已自動索引 data 資料夾內 {file_count} 份出差報告")
     
+    if "vector_db" in st.session_state and len(st.session_state.vector_db) > 0:
+        st.success(f"✅ 系統已自動索引 {file_count} 份報告 (模型: {EMBED_MODEL.split('/')[-1]})")
+    else:
+        st.warning(f"⚠️ 找到 {file_count} 份報告，但索引建立失敗或還在處理中。")
+        
     st.subheader("📥 臨時額外追加檔案")
     uploaded_files = st.file_uploader("上傳新的 PDF（僅供本次對話查詢）", accept_multiple_files=True, type=['pdf'])
     
@@ -132,7 +160,7 @@ with st.sidebar:
         if new_chunks:
             texts_to_embed = [c["text"] for c in new_chunks]
             try:
-                res = genai.embed_content(model="models/text-embedding-004", content=texts_to_embed)
+                res = genai.embed_content(model=EMBED_MODEL, content=texts_to_embed)
                 for chunk, emb in zip(new_chunks, res['embedding']):
                     chunk["embedding"] = emb
                     st.session_state.vector_db.append(chunk)
@@ -150,9 +178,13 @@ if prompt := st.chat_input("請輸入關於出差經驗或客戶的問題..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("assistant"):
-        with st.spinner("🔍 正在海量檔案中進行智慧檢索與分析..."):
+        if not st.session_state.vector_db:
+            st.error("系統資料庫目前為空或初始化失敗，請嘗試清除快取。")
+            st.stop()
+            
+        with st.spinner(f"🔍 正在海量檔案中進行智慧檢索... (使用 {EMBED_MODEL.split('/')[-1]})"):
             try:
-                q_res = genai.embed_content(model="models/text-embedding-004", content=[prompt])
+                q_res = genai.embed_content(model=EMBED_MODEL, content=[prompt])
                 q_emb = q_res['embedding'][0]
                 
                 scored_chunks = []
@@ -170,7 +202,7 @@ if prompt := st.chat_input("請輸入關於出差經驗或客戶的問題..."):
                         context_str += f"[來源檔案: {chunk['source']}]\n{chunk['text']}\n\n"
                         sources.add(chunk['source'])
                 
-                model = genai.GenerativeModel('gemini-1.5-flash')
+                model = genai.GenerativeModel(CHAT_MODEL)
                 
                 if context_str:
                     full_prompt = (
