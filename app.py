@@ -6,7 +6,7 @@ import numpy as np
 import re
 
 st.set_page_config(page_title="技銷金技出差經驗分享", page_icon="🚀", layout="wide")
-st.title("🚀 技銷金技出差經驗分享 (硬派備援檢索版)")
+st.title("🚀 技銷金技出差經驗分享 (不當機終極版)")
 
 if "GEMINI_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
@@ -14,8 +14,25 @@ else:
     st.error("錯誤：未在 Streamlit 後台設定 GEMINI_API_KEY 金鑰！")
     st.stop()
 
-# 直接寫死最穩定的向量模型
-EMBED_MODEL = "models/embedding-001"
+@st.cache_resource
+def get_embed_model():
+    """自動偵測可用的搜尋引擎，徹底消滅 404 錯誤"""
+    embed_model = "models/text-embedding-004" 
+    try:
+        available = [m for m in genai.list_models()]
+        embed_models = [m.name for m in available if 'embedContent' in m.supported_generation_methods]
+        
+        if "models/text-embedding-004" in embed_models:
+            embed_model = "models/text-embedding-004"
+        elif "models/embedding-001" in embed_models:
+            embed_model = "models/embedding-001"
+        elif embed_models:
+            embed_model = embed_models[0]
+    except Exception:
+        pass
+    return embed_model
+
+EMBED_MODEL = get_embed_model()
 
 def extract_text_from_pdf(pdf_file):
     text = ""
@@ -129,7 +146,7 @@ with st.sidebar:
     
     if "vector_db" in st.session_state and len(st.session_state.vector_db) > 0:
         st.success(f"✅ 系統已自動索引 {file_count} 份報告")
-        st.info("🛡️ 防護機制：已啟動『三段式硬派備援』，確保額度用盡時不當機。")
+        st.info(f"🔍 搜尋引擎: {EMBED_MODEL.split('/')[-1]}\n\n🛡️ 已啟動三段式備援防護。")
     else:
         st.warning(f"⚠️ 找到 {file_count} 份報告，但索引建立失敗。")
 
@@ -192,9 +209,6 @@ if prompt := st.chat_input("請輸入問題..."):
                         "請客氣地回答：'抱歉，目前的出差經驗知識庫中沒有檢索到直接相關的資料。您可以嘗試換個更明確的關鍵字。'"
                     )
                 
-                # ==========================================
-                # 🛡️ 核心修改：三段式硬派備援 (直接執行，不問金鑰清單)
-                # ==========================================
                 used_ai = ""
                 ai_reply = ""
                 
@@ -205,16 +219,16 @@ if prompt := st.chat_input("請輸入問題..."):
                     used_ai = "gemini-2.5-flash"
                     ai_reply = response.text
                 except Exception as e1:
-                    st.warning("⚠️ 2.5 版本額度已滿或無法使用，系統切換至 1.5 版本...")
+                    st.warning("⚠️ 2.5 版本額度已滿或無法使用，系統自動切換至 1.5 版本...")
                     try:
-                        # 第二擊：1.5 版 (每天 1500 次)
+                        # 第二擊：1.5 版
                         model = genai.GenerativeModel("gemini-1.5-flash")
                         response = model.generate_content(full_prompt)
                         used_ai = "gemini-1.5-flash"
                         ai_reply = response.text
                     except Exception as e2:
                         st.warning("⚠️ 1.5 版本也無法使用，啟動最終備援 pro 版本...")
-                        # 第三擊：最基礎的 pro 版 (絕對不會 404)
+                        # 第三擊：最基礎的 pro 版
                         model = genai.GenerativeModel("gemini-pro")
                         response = model.generate_content(full_prompt)
                         used_ai = "gemini-pro"
