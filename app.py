@@ -98,7 +98,7 @@ def build_knowledge_base(data_dir, mod_time):
     if not all_chunks:
         return database
     
-    # 分批將文字丟給 Google 轉換成向量 (Embedding)
+    # 分批將文字丟給 Google 轉換成向量
     texts_to_embed = [c["text"] for c in all_chunks]
     batch_size = 50
     embeddings = []
@@ -106,7 +106,8 @@ def build_knowledge_base(data_dir, mod_time):
     for i in range(0, len(texts_to_embed), batch_size):
         batch = texts_to_embed[i:i+batch_size]
         try:
-            res = genai.embed_content(model="models/text-embedding-004", content=batch)
+            # 這裡已修正為最穩定相容的 embedding-001 模型
+            res = genai.embed_content(model="models/embedding-001", content=batch)
             embeddings.extend(res['embedding'])
         except Exception as e:
             pass
@@ -126,7 +127,7 @@ current_mod_time = get_dir_mod_time(data_dir)
 
 # 確保只在網頁首次啟動或資料夾有變動時才顯示大載入畫面
 if "db_initialized" not in st.session_state:
-    with st.spinner("🔄 正在初始化企業級知識庫（正在為 200+ 份文件建立高階檢索索引，請稍候...）"):
+    with st.spinner("🔄 正在初始化企業級知識庫（正在為 197 份文件建立高階檢索索引，請稍候...）"):
         st.session_state.vector_db = build_knowledge_base(data_dir, current_mod_time)
         st.session_state.db_initialized = True
 else:
@@ -164,7 +165,8 @@ with st.sidebar:
         if new_chunks:
             texts_to_embed = [c["text"] for c in new_chunks]
             try:
-                res = genai.embed_content(model="models/text-embedding-004", content=texts_to_embed)
+                # 這裡已修正為最穩定相容的 embedding-001 模型
+                res = genai.embed_content(model="models/embedding-001", content=texts_to_embed)
                 for chunk, emb in zip(new_chunks, res['embedding']):
                     chunk["embedding"] = emb
                     st.session_state.vector_db.append(chunk)
@@ -189,8 +191,8 @@ if prompt := st.chat_input("請輸入關於出差經驗或客戶的問題..."):
     with st.chat_message("assistant"):
         with st.spinner("🔍 正在海量檔案中進行智慧檢索與分析..."):
             try:
-                # 🛠️ RAG 步驟 1: 將使用者的問題轉換成向量
-                q_res = genai.embed_content(model="models/text-embedding-004", content=[prompt])
+                # 🛠️ RAG 步驟 1: 將使用者的問題轉換成向量 (這裡已修正為 embedding-001)
+                q_res = genai.embed_content(model="models/embedding-001", content=[prompt])
                 q_emb = q_res['embedding'][0]
                 
                 # 🛠️ RAG 步驟 2: 計算問題與資料庫中所有文字塊的相似度
@@ -236,7 +238,7 @@ if prompt := st.chat_input("請輸入關於出差經驗或客戶的問題..."):
                 response = model.generate_content(full_prompt)
                 ai_reply = response.text
                 
-                # 🛠️ RAG 步驟 5: 如果有找到資料，在回答最下方附上精美的參考文獻標註
+                # 🛠️ RAG 步驟 5: 如果有找到資料，在回答最下方附上原始檔案來源標註
                 if sources:
                     ai_reply += "\n\n---\n**🔍 本次回答參考的原始檔案：**\n" + "\n".join([f"- 📄 {s}" for s in sources])
                 
