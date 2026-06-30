@@ -15,11 +15,13 @@ else:
 
 @st.cache_resource
 def get_best_models():
-    """動態偵測 API 金鑰支援的模型，徹底解決 404 錯誤"""
-    embed_model = "models/embedding-001" # 預設安全牌
-    chat_model = "gemini-1.5-flash"
+    """動態偵測 API 金鑰支援的模型，徹底解決所有 404 錯誤"""
+    embed_model = "models/embedding-001" 
+    chat_model = "gemini-pro" # 最保守的安全牌對話模型
     try:
         available = [m for m in genai.list_models()]
+        
+        # 1. 尋找支援的向量檢索模型
         embed_models = [m.name for m in available if 'embedContent' in m.supported_generation_methods]
         if "models/text-embedding-004" in embed_models:
             embed_model = "models/text-embedding-004"
@@ -27,6 +29,17 @@ def get_best_models():
             embed_model = "models/embedding-001"
         elif embed_models:
             embed_model = embed_models[0]
+            
+        # 2. 尋找支援的對話生成模型
+        chat_models = [m.name for m in available if 'generateContent' in m.supported_generation_methods]
+        if "models/gemini-1.5-flash" in chat_models:
+            chat_model = "gemini-1.5-flash"
+        elif "models/gemini-1.5-pro" in chat_models:
+            chat_model = "gemini-1.5-pro"
+        elif "models/gemini-pro" in chat_models:
+            chat_model = "gemini-pro"
+        elif chat_models:
+            chat_model = chat_models[0].replace("models/", "")
     except Exception:
         pass
     return embed_model, chat_model
@@ -105,13 +118,12 @@ def build_knowledge_base(data_dir, mod_time):
         try:
             res = genai.embed_content(model=EMBED_MODEL, content=batch)
             embeddings.extend(res['embedding'])
-        except Exception as e:
-            # 遇到錯誤時填補空向量，避免資料錯位
+        except Exception:
             for _ in batch:
                 embeddings.append([0.0]*768)
             
     for chunk, emb in zip(all_chunks, embeddings):
-        if any(v != 0.0 for v in emb): # 只儲存成功轉換的段落
+        if any(v != 0.0 for v in emb): 
             chunk["embedding"] = emb
             database.append(chunk)
             
@@ -121,7 +133,7 @@ data_dir = "data"
 current_mod_time = get_dir_mod_time(data_dir)
 
 if "db_initialized" not in st.session_state:
-    with st.spinner("🔄 正在初始化企業級知識庫（正在為近 200 份文件建立高階檢索索引，這可能需要幾分鐘，請耐心等候...）"):
+    with st.spinner("🔄 正在初始化企業級知識庫（正在讀取 197 份文件，這可能需要幾分鐘...）"):
         st.session_state.vector_db = build_knowledge_base(data_dir, current_mod_time)
         st.session_state.db_initialized = True
 else:
@@ -136,7 +148,7 @@ with st.sidebar:
     file_count = len([f for f in os.listdir(data_dir) if f.lower().endswith('.pdf')]) if os.path.exists(data_dir) else 0
     
     if "vector_db" in st.session_state and len(st.session_state.vector_db) > 0:
-        st.success(f"✅ 系統已自動索引 {file_count} 份報告 (模型: {EMBED_MODEL.split('/')[-1]})")
+        st.success(f"✅ 系統已自動索引 {file_count} 份報告\n(對話 AI: {CHAT_MODEL})")
     else:
         st.warning(f"⚠️ 找到 {file_count} 份報告，但索引建立失敗或還在處理中。")
         
@@ -182,7 +194,7 @@ if prompt := st.chat_input("請輸入關於出差經驗或客戶的問題..."):
             st.error("系統資料庫目前為空或初始化失敗，請嘗試清除快取。")
             st.stop()
             
-        with st.spinner(f"🔍 正在海量檔案中進行智慧檢索... (使用 {EMBED_MODEL.split('/')[-1]})"):
+        with st.spinner(f"🔍 正在海量檔案中進行智慧檢索... (使用 {CHAT_MODEL})"):
             try:
                 q_res = genai.embed_content(model=EMBED_MODEL, content=[prompt])
                 q_emb = q_res['embedding'][0]
