@@ -2,11 +2,9 @@ import os
 import streamlit as st
 import google.generativeai as genai
 from pypdf import PdfReader
-import numpy as np
-import re
 
 st.set_page_config(page_title="技銷金技出差經驗分享", page_icon="🚀", layout="wide")
-st.title("🚀 技銷金技出差經驗分享 (RAG 混合檢索終極版)")
+st.title("🚀 技銷金技出差經驗分享 (暴力全資料搜索版)")
 
 if "GEMINI_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
@@ -14,45 +12,8 @@ else:
     st.error("錯誤：未在 Streamlit 後台設定 GEMINI_API_KEY 金鑰！")
     st.stop()
 
-@st.cache_resource
-def get_best_models():
-    embed_model = "models/embedding-001" 
-    chat_model = "gemini-pro"
-    try:
-        available = [m for m in genai.list_models()]
-        embed_models = [m.name for m in available if 'embedContent' in m.supported_generation_methods]
-        if "models/text-embedding-004" in embed_models:
-            embed_model = "models/text-embedding-004"
-        elif "models/embedding-001" in embed_models:
-            embed_model = "models/embedding-001"
-        elif embed_models:
-            embed_model = embed_models[0]
-            
-        chat_models = [m.name for m in available if 'generateContent' in m.supported_generation_methods]
-        
-        if "models/gemini-3.1-pro" in chat_models:
-            chat_model = "gemini-3.1-pro"
-        elif "models/gemini-3.1-flash" in chat_models:
-            chat_model = "gemini-3.1-flash"
-        elif "models/gemini-3.1-flash-lite" in chat_models:
-            chat_model = "gemini-3.1-flash-lite"
-        elif "models/gemini-2.5-pro" in chat_models:
-            chat_model = "gemini-2.5-pro"
-        elif "models/gemini-2.5-flash" in chat_models:
-            chat_model = "gemini-2.5-flash"
-        elif "models/gemini-1.5-pro" in chat_models:
-            chat_model = "gemini-1.5-pro"
-        elif "models/gemini-1.5-flash" in chat_models:
-            chat_model = "gemini-1.5-flash"
-        elif "models/gemini-pro" in chat_models:
-            chat_model = "gemini-pro"
-        elif chat_models:
-            chat_model = chat_models[0].replace("models/", "")
-    except Exception:
-        pass
-    return embed_model, chat_model
-
-EMBED_MODEL, CHAT_MODEL = get_best_models()
+# 選擇支援超大上下文的模型 (Gemini 1.5 Pro / Flash 支援高達 100萬~200萬 Token)
+CHAT_MODEL = "gemini-1.5-pro" 
 
 def extract_text_from_pdf(pdf_file):
     text = ""
@@ -66,27 +27,6 @@ def extract_text_from_pdf(pdf_file):
         pass
     return text
 
-def split_text(text, chunk_size=800, chunk_overlap=150):
-    chunks = []
-    if not text:
-        return chunks
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        if end >= len(text):
-            break
-        start += chunk_size - chunk_overlap
-    return chunks
-
-def cosine_similarity(v1, v2):
-    dot_prod = np.dot(v1, v2)
-    norm1 = np.linalg.norm(v1)
-    norm2 = np.linalg.norm(v2)
-    if norm1 == 0 or norm2 == 0:
-        return 0
-    return dot_prod / (norm1 * norm2)
-
 def get_dir_mod_time(data_dir):
     if not os.path.exists(data_dir):
         return 0
@@ -97,158 +37,93 @@ def get_dir_mod_time(data_dir):
     return max(os.path.getmtime(os.path.join(data_dir, f)) for f in pdf_files)
 
 @st.cache_data(show_spinner=False)
-def build_knowledge_base(data_dir, mod_time):
-    database = []
+def load_all_documents(data_dir, mod_time):
+    """【全資料搜索核心】：不切碎、不轉換，直接把所有檔案讀成一篇超級無敵長的文字檔"""
+    all_text_content = ""
+    file_count = 0
+    
     if not os.path.exists(data_dir):
-        return database
+        return all_text_content, file_count
     
     pdf_files = [f for f in os.listdir(data_dir) if f.lower().endswith('.pdf')]
-    if not pdf_files:
-        return database
+    file_count = len(pdf_files)
     
-    all_chunks = []
+    if not pdf_files:
+        return all_text_content, file_count
+    
     for filename in pdf_files:
         file_path = os.path.join(data_dir, filename)
         text = extract_text_from_pdf(file_path)
-        chunks = split_text(text)
-        for chunk in chunks:
-            search_content = f"報告檔名：{filename}\n內容：{chunk}"
-            all_chunks.append({"text": chunk, "source": filename, "search_content": search_content})
-    
-    if not all_chunks:
-        return database
-    
-    texts_to_embed = [c["search_content"] for c in all_chunks]
-    batch_size = 50
-    embeddings = []
-    
-    for i in range(0, len(texts_to_embed), batch_size):
-        batch = texts_to_embed[i:i+batch_size]
-        try:
-            res = genai.embed_content(model=EMBED_MODEL, content=batch)
-            embeddings.extend(res['embedding'])
-        except Exception:
-            for _ in batch:
-                embeddings.append([0.0]*768)
+        # 把檔名跟內容完整拼接
+        all_text_content += f"\n\n============================\n"
+        all_text_content += f"【來源檔案】：{filename}\n"
+        all_text_content += f"============================\n{text}\n"
             
-    for chunk, emb in zip(all_chunks, embeddings):
-        if any(v != 0.0 for v in emb): 
-            chunk["embedding"] = emb
-            database.append(chunk)
-            
-    return database
-
-# --- 萃取關鍵字的輔助函式 ---
-def extract_keywords(prompt):
-    """移除常見贅字，萃取出真正有意義的搜尋關鍵字"""
-    stop_words = ["幫我", "找", "的", "報告", "請問", "有沒有", "出差", "資料", "哪些", "什麼", "關於"]
-    clean_prompt = prompt
-    for sw in stop_words:
-        clean_prompt = clean_prompt.replace(sw, " ")
-    # 用空白或標點符號切分，保留長度 >= 2 的詞
-    words = re.findall(r'\b\w+\b', clean_prompt)
-    return [w for w in words if len(w) >= 2]
+    return all_text_content, file_count
 
 data_dir = "data"
 current_mod_time = get_dir_mod_time(data_dir)
 
-if "db_initialized" not in st.session_state:
-    with st.spinner("🔄 正在初始化企業級知識庫（請耐心等候幾分鐘...）"):
-        st.session_state.vector_db = build_knowledge_base(data_dir, current_mod_time)
+if "full_database" not in st.session_state:
+    with st.spinner("🔄 正在讀取所有文件內容（正在將 100% 的資料載入記憶體，請稍候...）"):
+        all_text, count = load_all_documents(data_dir, current_mod_time)
+        st.session_state.full_database = all_text
+        st.session_state.file_count = count
         st.session_state.db_initialized = True
 else:
-    if "vector_db" not in st.session_state:
-        st.session_state.vector_db = build_knowledge_base(data_dir, current_mod_time)
+    if "full_database" not in st.session_state:
+        all_text, count = load_all_documents(data_dir, current_mod_time)
+        st.session_state.full_database = all_text
+        st.session_state.file_count = count
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 with st.sidebar:
     st.subheader("📁 文件中心")
-    file_count = len([f for f in os.listdir(data_dir) if f.lower().endswith('.pdf')]) if os.path.exists(data_dir) else 0
-    
-    if "vector_db" in st.session_state and len(st.session_state.vector_db) > 0:
-        st.success(f"✅ 系統已自動索引 {file_count} 份報告\n(對話 AI: {CHAT_MODEL})")
+    if st.session_state.file_count > 0:
+        st.success(f"✅ 系統已將 {st.session_state.file_count} 份報告的「完整內容」準備完畢，每次將進行 100% 全文比對。")
     else:
-        st.warning(f"⚠️ 找到 {file_count} 份報告，但索引建立失敗。")
+        st.warning("⚠️ 找不到報告。")
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-if prompt := st.chat_input("請輸入關於出差經驗或客戶的問題..."):
+if prompt := st.chat_input("請輸入問題... AI 將會閱讀全部 197 份報告來回答您！"):
     with st.chat_message("user"):
         st.markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("assistant"):
-        if not st.session_state.vector_db:
-            st.error("系統資料庫目前為空，請嘗試清除快取。")
+        if not st.session_state.full_database:
+            st.error("系統內沒有任何資料可以讀取。")
             st.stop()
             
-        with st.spinner(f"🔍 正在啟動「雙引擎混合檢索」(語意 + 關鍵字) 尋找核心資料..."):
+        with st.spinner(f"🔍 AI 正在從頭到尾閱讀所有資料... (如果字數過多可能會跳出 429 錯誤)"):
             try:
-                # 1. 語意檢索
-                q_res = genai.embed_content(model=EMBED_MODEL, content=[prompt])
-                q_emb = q_res['embedding'][0]
-                
-                # 2. 擷取關鍵字
-                keywords = extract_keywords(prompt)
-                
-                scored_chunks = []
-                for chunk in st.session_state.vector_db:
-                    # 基礎語意分數
-                    vec_score = cosine_similarity(q_emb, chunk["embedding"])
-                    
-                    # 關鍵字加權機制 (Keyword Boost)
-                    keyword_boost = 0.0
-                    for kw in keywords:
-                        if kw in chunk['source']:
-                            keyword_boost += 0.3  # 命中檔名，大幅加分！保證被看見
-                        if kw in chunk['text']:
-                            keyword_boost += 0.15 # 命中內文，中幅加分！
-                    
-                    # 最終分數 = 語意分數 + 關鍵字加權
-                    final_score = vec_score + keyword_boost
-                    scored_chunks.append((final_score, chunk))
-                
-                # 依據混合分數排序
-                scored_chunks.sort(key=lambda x: x[0], reverse=True)
-                top_k = scored_chunks[:60] # 擴大提取 60 段
-                
-                context_str = ""
-                sources = set()
-                for score, chunk in top_k:
-                    # 門檻微調：因為有加權，總分會變高，我們抓大於 0.2 的資料
-                    if score > 0.2:
-                        context_str += f"[來源檔案: {chunk['source']}]\n{chunk['text']}\n\n"
-                        sources.add(chunk['source'])
-                
+                # 建立 AI 模型 (使用最能處理長文的 1.5-pro)
                 model = genai.GenerativeModel(CHAT_MODEL)
                 
-                if context_str:
-                    full_prompt = (
-                        "你是一個專門分析公司內部『技銷金技出差經驗與廠商資料』的高階 AI 智能助理。\n"
-                        "請根據以下從數百份檔案中精確檢索出來的【相關知識庫段落】內容，全面且準確地回答使用者的問題。\n"
-                        "在回答時，請務必主動提及你是從哪些來源檔案中找到這些資訊的。如果使用者是在找特定人名、料號或地名，請優先列出符合的資料。\n"
-                        "如果檢索出的內容與問題完全無關，請回答：'抱歉，從目前的出差報告中找不到直接相關的紀錄。'\n\n"
-                        f"【精確檢索的知識庫段落】:\n{context_str}\n"
-                        f"【使用者問題】: {prompt}"
-                    )
-                else:
-                    full_prompt = (
-                        f"使用者問了問題：「{prompt}」，但目前系統在數百份檔案中沒有檢索到直接相關的段落。\n"
-                        "請客氣地回答：'抱歉，目前的出差經驗知識庫中沒有檢索到直接相關的資料。您可以嘗試換個關鍵字。'"
-                    )
-                    
+                # 【全資料搜索】：直接把幾十萬字全部塞進提示詞
+                full_prompt = (
+                    "你是一個專門分析公司內部『技銷金技出差經驗與廠商資料』的高階 AI 智能助理。\n"
+                    "我將提供公司【所有的出差報告完整內容】給你。請你務必「從頭到尾」仔細閱讀所有的內容，絕對不可以遺漏任何一份檔案。\n"
+                    "請根據這些內容，全面、精準且毫無遺漏地回答使用者的問題。回答時，請務必標示資料是來自哪一份檔案（例如：130131 江富誠...報告）。\n\n"
+                    f"【公司所有出差報告完整內容】:\n{st.session_state.full_database}\n\n"
+                    f"【使用者問題】: {prompt}"
+                )
+                
                 response = model.generate_content(full_prompt)
                 ai_reply = response.text
-                
-                if sources:
-                    ai_reply += "\n\n---\n**🔍 本次回答參考的原始檔案：**\n" + "\n".join([f"- 📄 {s}" for s in sources])
                 
                 st.markdown(ai_reply)
                 st.session_state.messages.append({"role": "assistant", "content": ai_reply})
                 
             except Exception as e:
-                st.error(f"系統檢索或呼叫 AI 時發生錯誤，請稍後重試。錯誤訊息: {e}")
+                # 攔截 429 錯誤並給予白話文提示
+                error_msg = str(e)
+                if "429" in error_msg:
+                    st.error("🚨 發生 429 錯誤！這代表您的 197 份報告總字數「超過了 Google 免費版金鑰的極限」。您必須刪減 data 資料夾內的檔案數量，或升級付費版 Google API。")
+                else:
+                    st.error(f"系統呼叫 AI 時發生錯誤: {error_msg}")
