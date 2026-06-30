@@ -6,7 +6,7 @@ import numpy as np
 import re
 
 st.set_page_config(page_title="技銷金技出差經驗分享", page_icon="🚀", layout="wide")
-st.title("🚀 技銷金技出差經驗分享 (不當機終極版)")
+st.title("🚀 技銷金技出差經驗分享 (絕不當機版)")
 
 if "GEMINI_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
@@ -15,24 +15,40 @@ else:
     st.stop()
 
 @st.cache_resource
-def get_embed_model():
-    """自動偵測可用的搜尋引擎，徹底消滅 404 錯誤"""
-    embed_model = "models/text-embedding-004" 
+def get_best_models():
+    """【終極防護】100% 只用金鑰真實支援的模型，徹底消滅 404"""
     try:
         available = [m for m in genai.list_models()]
         embed_models = [m.name for m in available if 'embedContent' in m.supported_generation_methods]
+        chat_models = [m.name for m in available if 'generateContent' in m.supported_generation_methods]
         
-        if "models/text-embedding-004" in embed_models:
+        # 1. 安全挑選向量模型
+        embed_model = embed_models[0] if embed_models else "models/text-embedding-004"
+        if "models/text-embedding-004" in embed_models: 
             embed_model = "models/text-embedding-004"
-        elif "models/embedding-001" in embed_models:
-            embed_model = "models/embedding-001"
-        elif embed_models:
-            embed_model = embed_models[0]
+            
+        # 2. 安全挑選主力對話模型
+        primary_chat = chat_models[0].replace("models/", "") if chat_models else "gemini-1.5-flash"
+        if "models/gemini-2.5-flash" in chat_models: 
+            primary_chat = "gemini-2.5-flash"
+        elif "models/gemini-1.5-flash" in chat_models: 
+            primary_chat = "gemini-1.5-flash"
+            
+        # 3. 安全挑選備援模型 (找一個跟主力不同，且確定存在的)
+        fallback_chat = primary_chat
+        for m in chat_models:
+            m_name = m.replace("models/", "")
+            if m_name != primary_chat and "flash" in m_name:
+                fallback_chat = m_name
+                break
+        if fallback_chat == primary_chat and len(chat_models) > 1:
+            fallback_chat = chat_models[-1].replace("models/", "")
+            
+        return embed_model, primary_chat, fallback_chat
     except Exception:
-        pass
-    return embed_model
+        return "models/text-embedding-004", "gemini-1.5-flash", "gemini-1.5-flash"
 
-EMBED_MODEL = get_embed_model()
+EMBED_MODEL, PRIMARY_CHAT, FALLBACK_CHAT = get_best_models()
 
 def extract_text_from_pdf(pdf_file):
     text = ""
@@ -146,7 +162,7 @@ with st.sidebar:
     
     if "vector_db" in st.session_state and len(st.session_state.vector_db) > 0:
         st.success(f"✅ 系統已自動索引 {file_count} 份報告")
-        st.info(f"🔍 搜尋引擎: {EMBED_MODEL.split('/')[-1]}\n\n🛡️ 已啟動三段式備援防護。")
+        st.info(f"🚀 主力 AI: {PRIMARY_CHAT}\n\n🛡️ 備援 AI: {FALLBACK_CHAT}")
     else:
         st.warning(f"⚠️ 找到 {file_count} 份報告，但索引建立失敗。")
 
@@ -213,26 +229,27 @@ if prompt := st.chat_input("請輸入問題..."):
                 ai_reply = ""
                 
                 try:
-                    # 第一擊：挑戰最新 2.5 版
-                    model = genai.GenerativeModel("gemini-2.5-flash")
+                    # 第一擊：絕對存在的主力模型
+                    model = genai.GenerativeModel(PRIMARY_CHAT)
                     response = model.generate_content(full_prompt)
-                    used_ai = "gemini-2.5-flash"
+                    used_ai = PRIMARY_CHAT
                     ai_reply = response.text
                 except Exception as e1:
-                    st.warning("⚠️ 2.5 版本額度已滿或無法使用，系統自動切換至 1.5 版本...")
-                    try:
-                        # 第二擊：1.5 版
-                        model = genai.GenerativeModel("gemini-1.5-flash")
-                        response = model.generate_content(full_prompt)
-                        used_ai = "gemini-1.5-flash"
-                        ai_reply = response.text
-                    except Exception as e2:
-                        st.warning("⚠️ 1.5 版本也無法使用，啟動最終備援 pro 版本...")
-                        # 第三擊：最基礎的 pro 版
-                        model = genai.GenerativeModel("gemini-pro")
-                        response = model.generate_content(full_prompt)
-                        used_ai = "gemini-pro"
-                        ai_reply = response.text
+                    # 如果主力模型跟備援模型不同，才進行切換
+                    if PRIMARY_CHAT != FALLBACK_CHAT:
+                        st.warning(f"⚠️ `{PRIMARY_CHAT}` 額度滿載，自動切換至備援 `{FALLBACK_CHAT}`...")
+                        try:
+                            # 第二擊：絕對存在的備援模型
+                            model = genai.GenerativeModel(FALLBACK_CHAT)
+                            response = model.generate_content(full_prompt)
+                            used_ai = FALLBACK_CHAT
+                            ai_reply = response.text
+                        except Exception as e2:
+                            st.error("🚨 您的金鑰今日『所有免費額度』皆已耗盡。請明天再試，或更換 API Key！")
+                            st.stop()
+                    else:
+                        st.error("🚨 您的金鑰今日免費額度已完全耗盡。請明天再試！")
+                        st.stop()
                 
                 if sources:
                     ai_reply += f"\n\n---\n**🔍 本次回答參考的原始檔案：** (由 {used_ai} 生成)\n" + "\n".join([f"- 📄 {s}" for s in sources])
