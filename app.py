@@ -30,48 +30,38 @@ genai.configure(api_key=API_KEY)
 # -----------------------------
 @st.cache_resource
 def get_model():
-
     try:
+        models = [
+            m.name.replace("models/", "")
+            for m in genai.list_models()
+            if "generateContent" in m.supported_generation_methods
+        ]
 
-        models = []
-
-        for m in genai.list_models():
-
-            if "generateContent" in m.supported_generation_methods:
-
-                models.append(m.name)
-
-        st.sidebar.success("成功取得模型")
-
+        st.sidebar.write("可用模型：")
         st.sidebar.write(models)
 
+        # 優先順序
         priority = [
-
-            "models/gemini-2.5-flash",
-
-            "models/gemini-2.5-pro",
-
-            "models/gemini-2.0-flash",
-
-            "models/gemini-1.5-flash"
-
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-flash",
+            "gemini-1.5-pro"
         ]
 
         for p in priority:
-
             if p in models:
+                return p
 
-                return p.replace("models/","")
-
-        if len(models)>0:
-
-            return models[0].replace("models/","")
+        if models:
+            return models[0]
 
     except Exception as e:
-
-        st.error(e)
+        st.sidebar.error(e)
 
     return None
+    
 
 MODEL_NAME = get_model()
 
@@ -83,7 +73,7 @@ if MODEL_NAME is None:
 
 st.sidebar.success(f"目前使用模型：{MODEL_NAME}")
 
-model = genai.GenerativeModel(MODEL_NAME)
+st.sidebar.info(f"目前模型：{MODEL_NAME}")
 
 # -----------------------------
 # PDF讀取
@@ -144,7 +134,15 @@ if not st.session_state.loaded:
 
             path=os.path.join("data",pdf)
 
-            st.session_state.knowledge+=extract_text(path)
+            text = extract_text(path)
+
+if text.strip():
+
+    st.session_state.knowledge += "\n\n"
+
+    st.session_state.knowledge += f"===== {pdf} =====\n"
+
+    st.session_state.knowledge += text
 
     st.session_state.loaded=True
 
@@ -219,8 +217,10 @@ if prompt:
 
 ==============================
 
-{st.session_state.knowledge}
+MAX_CHARS = 800000
 
+knowledge = st.session_state.knowledge[-MAX_CHARS:]
+{knowledge}
 ==============================
 
 請依照以上內容回答。
@@ -243,13 +243,26 @@ if prompt:
 
             try:
 
-                response=model.generate_content(
-
-                    system_prompt+"\n\n問題："+prompt
+                response = model.generate_content(
+    contents=system_prompt + "\n\n使用者問題：\n" + prompt
+)
 
                 )
 
-                answer=response.text
+                try:
+    answer = response.text
+except Exception:
+    answer = ""
+
+    if hasattr(response, "candidates"):
+        for c in response.candidates:
+            if c.content:
+                for p in c.content.parts:
+                    if hasattr(p, "text"):
+                        answer += p.text
+
+    if answer == "":
+        answer = "AI 沒有回傳任何內容。"
 
             except Exception as e:
 
