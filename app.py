@@ -6,7 +6,7 @@ import numpy as np
 import re
 
 st.set_page_config(page_title="技銷金技出差經驗分享", page_icon="🚀", layout="wide")
-st.title("🚀 技銷金技出差經驗分享 (精準斷詞版)")
+st.title("🚀 技銷金技出差經驗分享 (均衡檢索版)")
 
 if "GEMINI_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
@@ -130,24 +130,17 @@ def build_knowledge_base(data_dir, mod_time):
             
     return database
 
-# ==========================================
-# 🛡️ 核心修改：全新升級的中文斷詞與干擾詞過濾引擎
-# ==========================================
 def extract_keywords(prompt):
-    # 將常見的問句、否定詞、無意義字眼全部加入黑名單
     stop_words = [
         "幫我", "找", "的", "報告", "請問", "有沒有", "出差", "資料", "哪些", 
         "什麼", "關於", "整理", "所有", "人員", "沒有", "嗎", "紀錄", "呢",
-        "為何", "為什麼", "查", "一下", "怎麼", "找不到"
+        "為何", "為什麼", "查", "一下", "怎麼", "找不到", "歷年來", "次數", "地區", "趨勢"
     ]
     clean_prompt = prompt
     for sw in stop_words:
         clean_prompt = clean_prompt.replace(sw, " ")
         
-    # 將所有標點符號換成空白，徹底斷開字詞
     clean_prompt = re.sub(r'[^\w\s]', ' ', clean_prompt)
-    
-    # 用空白切分，只保留長度 2 以上的真正關鍵字（例如人名）
     words = clean_prompt.split()
     return [w for w in words if len(w) >= 2]
 
@@ -189,7 +182,7 @@ if prompt := st.chat_input("請輸入問題..."):
             st.error("系統資料庫目前為空，請嘗試清除快取。")
             st.stop()
             
-        with st.spinner(f"🔍 正在海量檔案中進行智慧檢索..."):
+        with st.spinner(f"🔍 正在啟動『均衡檢索機制』，確保不遺漏任何人員檔案..."):
             try:
                 q_res = genai.embed_content(model=EMBED_MODEL, content=[prompt])
                 q_emb = q_res['embedding'][0]
@@ -199,31 +192,49 @@ if prompt := st.chat_input("請輸入問題..."):
                 scored_chunks = []
                 for chunk in st.session_state.vector_db:
                     vec_score = cosine_similarity(q_emb, chunk["embedding"])
-                    
                     keyword_boost = 0.0
                     for kw in keywords:
                         if kw in chunk['source']:
-                            keyword_boost += 0.4  # 命中檔名，超大幅加分 (因為您合併成了人名檔)
+                            keyword_boost += 0.4  
                         if kw in chunk['text']:
-                            keyword_boost += 0.2  # 命中內文也加分
+                            keyword_boost += 0.2  
                     
                     final_score = vec_score + keyword_boost
                     scored_chunks.append((final_score, chunk))
                 
+                # 依分數排序
                 scored_chunks.sort(key=lambda x: x[0], reverse=True)
-                top_k = scored_chunks[:60] 
+                
+                # ==========================================
+                # 🛡️ 核心修改：各檔案「保障名額」機制
+                # ==========================================
+                top_k = []
+                file_chunk_count = {} # 用來記錄每份檔案被抽了幾段
+                
+                for score, chunk in scored_chunks:
+                    # 降低門檻到 0.1，確保模糊問題也能撈到資料
+                    if score > 0.1:
+                        source_file = chunk['source']
+                        # 限制每份檔案【最多只能提供 12 個段落】
+                        if file_chunk_count.get(source_file, 0) < 12:
+                            top_k.append((score, chunk))
+                            file_chunk_count[source_file] = file_chunk_count.get(source_file, 0) + 1
+                    
+                    # 總共收集 60 段就停止
+                    if len(top_k) >= 60:
+                        break
                 
                 context_str = ""
                 sources = set()
                 for score, chunk in top_k:
-                    if score > 0.15: # 稍微降低門檻，避免遺漏
-                        context_str += f"[來源檔案: {chunk['source']}]\n{chunk['text']}\n\n"
-                        sources.add(chunk['source'])
+                    context_str += f"[來源檔案: {chunk['source']}]\n{chunk['text']}\n\n"
+                    sources.add(chunk['source'])
                 
                 if context_str:
                     full_prompt = (
                         "你是一個專門分析公司內部『技銷金技出差經驗與廠商資料』的高階 AI 智能助理。\n"
-                        "請根據以下從數百份檔案中精確檢索出來的【相關知識庫段落】內容，全面且準確地回答使用者的問題。\n"
+                        "請根據以下從數百份檔案中精確檢索出來的【相關知識庫段落】內容，全面、客觀地回答使用者的問題。\n"
+                        "如果使用者要求『整理所有人』或提出『廣泛的分析』，請務必檢視所有提供的來源檔案，確保整理出不同人員的資料，不要只偏重某一個人。\n"
                         "在回答時，請務必主動提及你是從哪些來源檔案中找到這些資訊的。\n\n"
                         f"【精確檢索的知識庫段落】:\n{context_str}\n"
                         f"【使用者問題】: {prompt}"
