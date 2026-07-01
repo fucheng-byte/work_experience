@@ -246,9 +246,6 @@ knowledge = st.session_state.knowledge[-MAX_CHARS:]
                 response = model.generate_content(
     contents=system_prompt + "\n\n使用者問題：\n" + prompt
 )
-
-                )
-
                 try:
     answer = response.text
 except Exception:
