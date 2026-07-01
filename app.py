@@ -22,7 +22,13 @@ st.set_page_config(
 
 st.title("🚀 技銷金技出差經驗分享｜企業知識庫 V3 Lite")
 
-DATA_DIR = "data"
+if os.path.exists("data"):
+    DATA_DIR = "data"
+elif os.path.exists("DATA"):
+    DATA_DIR = "DATA"
+else:
+    DATA_DIR = "data"
+    os.makedirs(DATA_DIR, exist_ok=True)
 CACHE_DIR = "index_cache"
 DB_PATH = "answer_cache.db"
 
