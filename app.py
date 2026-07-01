@@ -1,10 +1,8 @@
 import os
-import re
 import time
 import pickle
 import hashlib
 import sqlite3
-from pathlib import Path
 
 import streamlit as st
 import google.generativeai as genai
@@ -22,6 +20,7 @@ st.set_page_config(
 
 st.title("🚀 技銷金技出差經驗分享｜企業知識庫 V3 Lite")
 
+# 自動偵測 data / DATA
 if os.path.exists("data"):
     DATA_DIR = "data"
 elif os.path.exists("DATA"):
@@ -29,6 +28,7 @@ elif os.path.exists("DATA"):
 else:
     DATA_DIR = "data"
     os.makedirs(DATA_DIR, exist_ok=True)
+
 CACHE_DIR = "index_cache"
 DB_PATH = "answer_cache.db"
 
@@ -50,7 +50,7 @@ except Exception:
 genai.configure(api_key=API_KEY)
 
 # =====================================================
-# 取得模型
+# 取得可用生成模型
 # =====================================================
 @st.cache_resource
 def get_available_models():
@@ -89,6 +89,41 @@ for m in available_models:
 if not fallback_models:
     st.error("目前沒有可用 Gemini 模型")
     st.stop()
+
+# =====================================================
+# 取得可用 Embedding 模型
+# =====================================================
+@st.cache_resource
+def get_embedding_model():
+    try:
+        models = list(genai.list_models())
+
+        usable = []
+        for m in models:
+            name = m.name
+            methods = getattr(m, "supported_generation_methods", [])
+
+            if "embedContent" in methods:
+                usable.append(name)
+
+        priority = [
+            "models/embedding-001",
+            "models/text-embedding-004"
+        ]
+
+        for p in priority:
+            if p in usable:
+                return p
+
+        if usable:
+            return usable[0]
+
+    except Exception as e:
+        st.sidebar.error(f"取得 Embedding 模型失敗：{e}")
+
+    return "models/embedding-001"
+
+EMBEDDING_MODEL = get_embedding_model()
 
 # =====================================================
 # SQLite 問答快取
@@ -189,7 +224,7 @@ def split_text_by_page(page_item, chunk_size=1000, overlap=200):
 # =====================================================
 def embed_document(text):
     result = genai.embed_content(
-        model="models/text-embedding-004",
+        model=EMBEDDING_MODEL,
         content=text,
         task_type="retrieval_document"
     )
@@ -197,7 +232,7 @@ def embed_document(text):
 
 def embed_question(text):
     result = genai.embed_content(
-        model="models/text-embedding-004",
+        model=EMBEDDING_MODEL,
         content=text,
         task_type="retrieval_query"
     )
@@ -214,7 +249,7 @@ def build_index(chunk_size=1000, overlap=200):
     ]
 
     if not pdf_files:
-        st.warning("data 資料夾內沒有 PDF")
+        st.warning(f"{DATA_DIR} 資料夾內沒有 PDF")
         return [], None
 
     all_chunks = []
@@ -242,6 +277,7 @@ def build_index(chunk_size=1000, overlap=200):
         return [], None
 
     vectors = []
+    embedded_chunks = []
 
     for i, chunk in enumerate(all_chunks):
         status.write(f"正在建立 Embedding：{i + 1}/{len(all_chunks)}")
@@ -249,10 +285,11 @@ def build_index(chunk_size=1000, overlap=200):
         try:
             vec = embed_document(chunk["text"])
             vectors.append(vec)
-            time.sleep(0.05)
+            embedded_chunks.append(chunk)
+            time.sleep(0.08)
 
         except Exception as e:
-            st.error(f"Embedding 失敗：第 {i + 1} 段｜{e}")
+            st.warning(f"第 {i + 1} 段 Embedding 失敗，已略過：{e}")
             continue
 
     if not vectors:
@@ -267,12 +304,12 @@ def build_index(chunk_size=1000, overlap=200):
     np.save(EMBEDDING_PATH, embeddings)
 
     with open(METADATA_PATH, "wb") as f:
-        pickle.dump(all_chunks, f)
+        pickle.dump(embedded_chunks, f)
 
     progress.empty()
     status.success("索引建立完成")
 
-    return all_chunks, embeddings
+    return embedded_chunks, embeddings
 
 # =====================================================
 # 載入索引
@@ -439,6 +476,9 @@ with st.sidebar:
     st.write("目前可用模型：")
     st.write(available_models)
 
+    st.write("目前 Embedding 模型：")
+    st.code(EMBEDDING_MODEL)
+
     st.divider()
 
     st.header("📁 文件中心")
@@ -510,6 +550,7 @@ with st.sidebar:
         if f.lower().endswith(".pdf")
     ])
 
+    st.write(f"PDF 資料夾：{DATA_DIR}")
     st.write(f"PDF 數量：{pdf_count}")
 
 # =====================================================
@@ -518,7 +559,7 @@ with st.sidebar:
 metadata, embeddings = load_index()
 
 if embeddings is None or not metadata:
-    st.warning("目前尚未建立索引。請先上傳 PDF，然後按左側「重新建立索引」。")
+    st.warning("目前尚未建立索引。請先確認 PDF 已在 data 或 DATA 資料夾，然後按左側「重新建立索引」。")
 else:
     st.success(f"知識庫已載入，共 {len(metadata)} 個段落")
 
@@ -553,7 +594,7 @@ if question:
         with st.spinner("AI 分析中..."):
 
             if embeddings is None or not metadata:
-                answer = "目前尚未建立 PDF 知識庫索引，請先上傳 PDF 並重新建立索引。"
+                answer = "目前尚未建立 PDF 知識庫索引，請先確認 PDF 已在 data 或 DATA 資料夾，並重新建立索引。"
                 used_model = None
 
             else:
