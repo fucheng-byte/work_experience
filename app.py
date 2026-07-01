@@ -198,7 +198,7 @@ def extract_pdf_pages(file_path):
 # =====================================================
 # 切 Chunk
 # =====================================================
-def split_text_by_page(page_item, chunk_size=1000, overlap=200):
+def split_text_by_page(page_item, chunk_size=2000, overlap=50):
     text = page_item["text"]
     chunks = []
 
@@ -241,7 +241,7 @@ def embed_question(text):
 # =====================================================
 # 建立索引
 # =====================================================
-def build_index(chunk_size=1000, overlap=200):
+def build_index(chunk_size=2000, overlap=50):
     pdf_files = [
         os.path.join(DATA_DIR, f)
         for f in os.listdir(DATA_DIR)
@@ -286,7 +286,7 @@ def build_index(chunk_size=1000, overlap=200):
             vec = embed_document(chunk["text"])
             vectors.append(vec)
             embedded_chunks.append(chunk)
-            time.sleep(0.08)
+            time.sleep(0.12)
 
         except Exception as e:
             st.warning(f"第 {i + 1} 段 Embedding 失敗，已略過：{e}")
@@ -500,19 +500,21 @@ with st.sidebar:
 
     st.divider()
 
+    st.subheader("索引設定")
+
     chunk_size = st.slider(
         "Chunk 文字長度",
         min_value=500,
-        max_value=2000,
-        value=1000,
+        max_value=3000,
+        value=2000,
         step=100
     )
 
     overlap = st.slider(
         "Chunk 重疊字數",
-        min_value=50,
+        min_value=0,
         max_value=500,
-        value=200,
+        value=50,
         step=50
     )
 
@@ -525,6 +527,8 @@ with st.sidebar:
     )
 
     use_cache = st.checkbox("啟用相同問題快取", value=True)
+
+    st.info("已有索引時，平常提問不會重跑 Embedding；只有按下方按鈕才會重新建立索引。")
 
     if st.button("🔄 重新建立索引"):
         if os.path.exists(EMBEDDING_PATH):
@@ -552,6 +556,11 @@ with st.sidebar:
 
     st.write(f"PDF 資料夾：{DATA_DIR}")
     st.write(f"PDF 數量：{pdf_count}")
+
+    if os.path.exists(EMBEDDING_PATH) and os.path.exists(METADATA_PATH):
+        st.success("目前已有索引檔，提問時不會重新建立 Embedding")
+    else:
+        st.warning("目前尚未建立索引")
 
 # =====================================================
 # 載入索引
