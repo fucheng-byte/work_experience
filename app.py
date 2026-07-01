@@ -6,7 +6,7 @@ import numpy as np
 import re
 
 st.set_page_config(page_title="技銷金技出差經驗分享", page_icon="🚀", layout="wide")
-st.title("🚀 技銷金技出差經驗分享 (絕不當機版)")
+st.title("🚀 技銷金技出差經驗分享 (精準斷詞版)")
 
 if "GEMINI_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
@@ -16,25 +16,21 @@ else:
 
 @st.cache_resource
 def get_best_models():
-    """【終極防護】100% 只用金鑰真實支援的模型，徹底消滅 404"""
     try:
         available = [m for m in genai.list_models()]
         embed_models = [m.name for m in available if 'embedContent' in m.supported_generation_methods]
         chat_models = [m.name for m in available if 'generateContent' in m.supported_generation_methods]
         
-        # 1. 安全挑選向量模型
         embed_model = embed_models[0] if embed_models else "models/text-embedding-004"
         if "models/text-embedding-004" in embed_models: 
             embed_model = "models/text-embedding-004"
             
-        # 2. 安全挑選主力對話模型
         primary_chat = chat_models[0].replace("models/", "") if chat_models else "gemini-1.5-flash"
         if "models/gemini-2.5-flash" in chat_models: 
             primary_chat = "gemini-2.5-flash"
         elif "models/gemini-1.5-flash" in chat_models: 
             primary_chat = "gemini-1.5-flash"
             
-        # 3. 安全挑選備援模型 (找一個跟主力不同，且確定存在的)
         fallback_chat = primary_chat
         for m in chat_models:
             m_name = m.replace("models/", "")
@@ -134,12 +130,25 @@ def build_knowledge_base(data_dir, mod_time):
             
     return database
 
+# ==========================================
+# 🛡️ 核心修改：全新升級的中文斷詞與干擾詞過濾引擎
+# ==========================================
 def extract_keywords(prompt):
-    stop_words = ["幫我", "找", "的", "報告", "請問", "有沒有", "出差", "資料", "哪些", "什麼", "關於", "整理", "所有", "人員"]
+    # 將常見的問句、否定詞、無意義字眼全部加入黑名單
+    stop_words = [
+        "幫我", "找", "的", "報告", "請問", "有沒有", "出差", "資料", "哪些", 
+        "什麼", "關於", "整理", "所有", "人員", "沒有", "嗎", "紀錄", "呢",
+        "為何", "為什麼", "查", "一下", "怎麼", "找不到"
+    ]
     clean_prompt = prompt
     for sw in stop_words:
         clean_prompt = clean_prompt.replace(sw, " ")
-    words = re.findall(r'\b\w+\b', clean_prompt)
+        
+    # 將所有標點符號換成空白，徹底斷開字詞
+    clean_prompt = re.sub(r'[^\w\s]', ' ', clean_prompt)
+    
+    # 用空白切分，只保留長度 2 以上的真正關鍵字（例如人名）
+    words = clean_prompt.split()
     return [w for w in words if len(w) >= 2]
 
 data_dir = "data"
@@ -161,7 +170,7 @@ with st.sidebar:
     file_count = len([f for f in os.listdir(data_dir) if f.lower().endswith('.pdf')]) if os.path.exists(data_dir) else 0
     
     if "vector_db" in st.session_state and len(st.session_state.vector_db) > 0:
-        st.success(f"✅ 系統已自動索引 {file_count} 份報告")
+        st.success(f"✅ 系統已自動索引 {file_count} 份合併報告")
         st.info(f"🚀 主力 AI: {PRIMARY_CHAT}\n\n🛡️ 備援 AI: {FALLBACK_CHAT}")
     else:
         st.warning(f"⚠️ 找到 {file_count} 份報告，但索引建立失敗。")
@@ -194,9 +203,9 @@ if prompt := st.chat_input("請輸入問題..."):
                     keyword_boost = 0.0
                     for kw in keywords:
                         if kw in chunk['source']:
-                            keyword_boost += 0.3  
+                            keyword_boost += 0.4  # 命中檔名，超大幅加分 (因為您合併成了人名檔)
                         if kw in chunk['text']:
-                            keyword_boost += 0.15 
+                            keyword_boost += 0.2  # 命中內文也加分
                     
                     final_score = vec_score + keyword_boost
                     scored_chunks.append((final_score, chunk))
@@ -207,7 +216,7 @@ if prompt := st.chat_input("請輸入問題..."):
                 context_str = ""
                 sources = set()
                 for score, chunk in top_k:
-                    if score > 0.2:
+                    if score > 0.15: # 稍微降低門檻，避免遺漏
                         context_str += f"[來源檔案: {chunk['source']}]\n{chunk['text']}\n\n"
                         sources.add(chunk['source'])
                 
@@ -221,34 +230,31 @@ if prompt := st.chat_input("請輸入問題..."):
                     )
                 else:
                     full_prompt = (
-                        f"使用者問了問題：「{prompt}」，但目前系統在數百份檔案中沒有檢索到直接相關的段落。\n"
-                        "請客氣地回答：'抱歉，目前的出差經驗知識庫中沒有檢索到直接相關的資料。您可以嘗試換個更明確的關鍵字。'"
+                        f"使用者問了問題：「{prompt}」，但目前系統在檔案中沒有檢索到直接相關的段落。\n"
+                        "請客氣地回答：'抱歉，目前的出差經驗知識庫中沒有檢索到直接相關的資料。您可以嘗試直接輸入人名或更明確的關鍵字。'"
                     )
                 
                 used_ai = ""
                 ai_reply = ""
                 
                 try:
-                    # 第一擊：絕對存在的主力模型
                     model = genai.GenerativeModel(PRIMARY_CHAT)
                     response = model.generate_content(full_prompt)
                     used_ai = PRIMARY_CHAT
                     ai_reply = response.text
                 except Exception as e1:
-                    # 如果主力模型跟備援模型不同，才進行切換
                     if PRIMARY_CHAT != FALLBACK_CHAT:
                         st.warning(f"⚠️ `{PRIMARY_CHAT}` 額度滿載，自動切換至備援 `{FALLBACK_CHAT}`...")
                         try:
-                            # 第二擊：絕對存在的備援模型
                             model = genai.GenerativeModel(FALLBACK_CHAT)
                             response = model.generate_content(full_prompt)
                             used_ai = FALLBACK_CHAT
                             ai_reply = response.text
                         except Exception as e2:
-                            st.error("🚨 您的金鑰今日『所有免費額度』皆已耗盡。請明天再試，或更換 API Key！")
+                            st.error("🚨 您的金鑰今日『所有免費額度』皆已耗盡。請更換 API Key！")
                             st.stop()
                     else:
-                        st.error("🚨 您的金鑰今日免費額度已完全耗盡。請明天再試！")
+                        st.error("🚨 您的金鑰今日免費額度已完全耗盡。請更換 API Key！")
                         st.stop()
                 
                 if sources:
