@@ -1,17 +1,15 @@
 import os
 import re
 import time
-import json
+import pickle
 import hashlib
 import sqlite3
-import pickle
 from pathlib import Path
 
 import streamlit as st
 import google.generativeai as genai
 from pypdf import PdfReader
 import numpy as np
-import faiss
 
 # =====================================================
 # 基本設定
@@ -22,17 +20,17 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🚀 技銷金技出差經驗分享｜企業知識庫 V3")
+st.title("🚀 技銷金技出差經驗分享｜企業知識庫 V3 Lite")
 
 DATA_DIR = "data"
-INDEX_DIR = "index_cache"
+CACHE_DIR = "index_cache"
 DB_PATH = "answer_cache.db"
 
 os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(INDEX_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-INDEX_PATH = os.path.join(INDEX_DIR, "faiss.index")
-META_PATH = os.path.join(INDEX_DIR, "metadata.pkl")
+EMBEDDING_PATH = os.path.join(CACHE_DIR, "embeddings.npy")
+METADATA_PATH = os.path.join(CACHE_DIR, "metadata.pkl")
 
 # =====================================================
 # API KEY
@@ -46,7 +44,7 @@ except Exception:
 genai.configure(api_key=API_KEY)
 
 # =====================================================
-# Gemini 模型設定
+# 取得模型
 # =====================================================
 @st.cache_resource
 def get_available_models():
@@ -72,8 +70,6 @@ MODEL_PRIORITY = [
     "gemini-flash-latest",
     "gemini-2.5-flash",
     "gemini-2.5-pro",
-    "gemini-2.5-flash-preview-tts",
-    "gemini-2.5-pro-preview-tts",
     "gemma-4-26b-a4b-it",
     "gemma-4-31b-it"
 ]
@@ -89,7 +85,7 @@ if not fallback_models:
     st.stop()
 
 # =====================================================
-# SQLite 快取
+# SQLite 問答快取
 # =====================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -108,6 +104,7 @@ def init_db():
 
 def get_cache(question):
     key = hashlib.md5(question.strip().encode("utf-8")).hexdigest()
+
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT answer, model FROM answer_cache WHERE key=?", (key,))
@@ -116,10 +113,12 @@ def get_cache(question):
 
     if row:
         return row[0], row[1]
+
     return None, None
 
 def save_cache(question, answer, model):
     key = hashlib.md5(question.strip().encode("utf-8")).hexdigest()
+
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
@@ -163,6 +162,7 @@ def split_text_by_page(page_item, chunk_size=1000, overlap=200):
     chunks = []
 
     start = 0
+
     while start < len(text):
         end = start + chunk_size
         chunk_text = text[start:end]
@@ -181,7 +181,7 @@ def split_text_by_page(page_item, chunk_size=1000, overlap=200):
 # =====================================================
 # Embedding
 # =====================================================
-def embed_text(text):
+def embed_document(text):
     result = genai.embed_content(
         model="models/text-embedding-004",
         content=text,
@@ -189,7 +189,7 @@ def embed_text(text):
     )
     return np.array(result["embedding"], dtype="float32")
 
-def embed_query(text):
+def embed_question(text):
     result = genai.embed_content(
         model="models/text-embedding-004",
         content=text,
@@ -198,11 +198,9 @@ def embed_query(text):
     return np.array(result["embedding"], dtype="float32")
 
 # =====================================================
-# 建立 FAISS 索引
+# 建立索引
 # =====================================================
 def build_index(chunk_size=1000, overlap=200):
-    all_chunks = []
-
     pdf_files = [
         os.path.join(DATA_DIR, f)
         for f in os.listdir(DATA_DIR)
@@ -210,13 +208,17 @@ def build_index(chunk_size=1000, overlap=200):
     ]
 
     if not pdf_files:
-        return None, []
+        st.warning("data 資料夾內沒有 PDF")
+        return [], None
+
+    all_chunks = []
 
     progress = st.progress(0)
     status = st.empty()
 
     for i, pdf in enumerate(pdf_files):
-        status.write(f"正在讀取：{os.path.basename(pdf)}")
+        status.write(f"正在讀取 PDF：{os.path.basename(pdf)}")
+
         pages = extract_pdf_pages(pdf)
 
         for page in pages:
@@ -230,67 +232,75 @@ def build_index(chunk_size=1000, overlap=200):
         progress.progress((i + 1) / len(pdf_files))
 
     if not all_chunks:
-        return None, []
+        st.warning("PDF 沒有讀取到文字，可能是掃描圖片型 PDF")
+        return [], None
 
     vectors = []
 
     for i, chunk in enumerate(all_chunks):
-        status.write(f"建立 Embedding：{i + 1}/{len(all_chunks)}")
-        vec = embed_text(chunk["text"])
-        vectors.append(vec)
-        time.sleep(0.05)
+        status.write(f"正在建立 Embedding：{i + 1}/{len(all_chunks)}")
 
-    vectors = np.vstack(vectors).astype("float32")
+        try:
+            vec = embed_document(chunk["text"])
+            vectors.append(vec)
+            time.sleep(0.05)
 
-    faiss.normalize_L2(vectors)
+        except Exception as e:
+            st.error(f"Embedding 失敗：第 {i + 1} 段｜{e}")
+            continue
 
-    dimension = vectors.shape[1]
-    index = faiss.IndexFlatIP(dimension)
-    index.add(vectors)
+    if not vectors:
+        st.error("沒有成功建立任何 Embedding")
+        return [], None
 
-    faiss.write_index(index, INDEX_PATH)
+    embeddings = np.vstack(vectors).astype("float32")
 
-    with open(META_PATH, "wb") as f:
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    embeddings = embeddings / np.maximum(norms, 1e-10)
+
+    np.save(EMBEDDING_PATH, embeddings)
+
+    with open(METADATA_PATH, "wb") as f:
         pickle.dump(all_chunks, f)
 
-    status.success("索引建立完成")
     progress.empty()
+    status.success("索引建立完成")
 
-    return index, all_chunks
+    return all_chunks, embeddings
 
 # =====================================================
 # 載入索引
 # =====================================================
 @st.cache_resource
 def load_index():
-    if not os.path.exists(INDEX_PATH) or not os.path.exists(META_PATH):
-        return None, []
+    if not os.path.exists(EMBEDDING_PATH) or not os.path.exists(METADATA_PATH):
+        return [], None
 
-    index = faiss.read_index(INDEX_PATH)
+    embeddings = np.load(EMBEDDING_PATH)
 
-    with open(META_PATH, "rb") as f:
+    with open(METADATA_PATH, "rb") as f:
         metadata = pickle.load(f)
 
-    return index, metadata
+    return metadata, embeddings
 
 # =====================================================
-# 搜尋相關 Chunk
+# 搜尋 Chunk
 # =====================================================
-def search_chunks(question, index, metadata, top_k=40):
-    q_vec = embed_query(question).reshape(1, -1).astype("float32")
-    faiss.normalize_L2(q_vec)
+def search_chunks(question, metadata, embeddings, top_k=50):
+    q_vec = embed_question(question).astype("float32")
+    q_vec = q_vec / max(np.linalg.norm(q_vec), 1e-10)
 
-    scores, ids = index.search(q_vec, top_k)
+    scores = embeddings @ q_vec
+
+    top_indices = np.argsort(scores)[::-1][:top_k]
 
     results = []
 
-    for score, idx in zip(scores[0], ids[0]):
-        if idx == -1:
-            continue
-
+    for idx in top_indices:
         item = metadata[idx]
+
         results.append({
-            "score": float(score),
+            "score": float(scores[idx]),
             "file": item["file"],
             "page": item["page"],
             "text": item["text"]
@@ -344,12 +354,19 @@ def generate_with_fallback(prompt_text, selected_model="AUTO"):
     return "所有模型都無法使用。\n\n錯誤紀錄：\n" + "\n\n".join(errors), None
 
 # =====================================================
-# 建立回答 Prompt
+# 建立 Prompt
 # =====================================================
 def build_prompt(question, search_results):
     context = ""
 
+    used_sources = []
+
     for i, r in enumerate(search_results, 1):
+        source = f'{r["file"]}｜第 {r["page"]} 頁'
+
+        if source not in used_sources:
+            used_sources.append(source)
+
         context += f"""
 【資料 {i}】
 來源：{r["file"]}｜第 {r["page"]} 頁
@@ -358,6 +375,8 @@ def build_prompt(question, search_results):
 內容：
 {r["text"]}
 """
+
+    source_text = "\n".join([f"- {s}" for s in used_sources[:20]])
 
     prompt = f"""
 你是一位技術服務專家，熟悉技銷、金技、鋁陽極染色、客戶拜訪、出差經驗整理與技術文件分析。
@@ -385,8 +404,8 @@ def build_prompt(question, search_results):
    - 技術交流注意事項
    - 當地文化與溝通注意事項
    - 出差後紀錄與追蹤
-8. 最後請列出「參考來源」，格式如下：
-   - 檔名｜第 X 頁
+8. 最後請列出「參考來源」，只能使用以下來源：
+{source_text}
 """
 
     return prompt
@@ -462,16 +481,19 @@ with st.sidebar:
     use_cache = st.checkbox("啟用相同問題快取", value=True)
 
     if st.button("🔄 重新建立索引"):
-        if os.path.exists(INDEX_PATH):
-            os.remove(INDEX_PATH)
+        if os.path.exists(EMBEDDING_PATH):
+            os.remove(EMBEDDING_PATH)
 
-        if os.path.exists(META_PATH):
-            os.remove(META_PATH)
+        if os.path.exists(METADATA_PATH):
+            os.remove(METADATA_PATH)
 
         st.cache_resource.clear()
 
         with st.spinner("正在重新建立索引，第一次會比較久..."):
-            build_index(chunk_size=chunk_size, overlap=overlap)
+            build_index(
+                chunk_size=chunk_size,
+                overlap=overlap
+            )
 
         st.success("索引已重新建立，請重新整理頁面")
 
@@ -487,10 +509,10 @@ with st.sidebar:
 # =====================================================
 # 載入索引
 # =====================================================
-index, metadata = load_index()
+metadata, embeddings = load_index()
 
-if index is None or not metadata:
-    st.warning("目前尚未建立索引。請先把 PDF 放到 data 資料夾，或從左側上傳 PDF，然後按「重新建立索引」。")
+if embeddings is None or not metadata:
+    st.warning("目前尚未建立索引。請先上傳 PDF，然後按左側「重新建立索引」。")
 else:
     st.success(f"知識庫已載入，共 {len(metadata)} 個段落")
 
@@ -524,7 +546,7 @@ if question:
     with st.chat_message("assistant"):
         with st.spinner("AI 分析中..."):
 
-            if index is None or not metadata:
+            if embeddings is None or not metadata:
                 answer = "目前尚未建立 PDF 知識庫索引，請先上傳 PDF 並重新建立索引。"
                 used_model = None
 
@@ -538,8 +560,8 @@ if question:
                     else:
                         results = search_chunks(
                             question,
-                            index,
                             metadata,
+                            embeddings,
                             top_k=top_k
                         )
 
@@ -556,8 +578,8 @@ if question:
                 else:
                     results = search_chunks(
                         question,
-                        index,
                         metadata,
+                        embeddings,
                         top_k=top_k
                     )
 
