@@ -1,22 +1,42 @@
 import os
+import re
+import time
+import json
+import hashlib
+import sqlite3
+import pickle
+from pathlib import Path
+
 import streamlit as st
 import google.generativeai as genai
 from pypdf import PdfReader
+import numpy as np
+import faiss
 
-# -----------------------------
-# Streamlit 設定
-# -----------------------------
+# =====================================================
+# 基本設定
+# =====================================================
 st.set_page_config(
     page_title="技銷金技出差經驗分享",
     page_icon="🚀",
     layout="wide"
 )
 
-st.title("🚀 技銷金技出差經驗分享（全文深度精讀版）")
+st.title("🚀 技銷金技出差經驗分享｜企業知識庫 V3")
 
-# -----------------------------
+DATA_DIR = "data"
+INDEX_DIR = "index_cache"
+DB_PATH = "answer_cache.db"
+
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(INDEX_DIR, exist_ok=True)
+
+INDEX_PATH = os.path.join(INDEX_DIR, "faiss.index")
+META_PATH = os.path.join(INDEX_DIR, "metadata.pkl")
+
+# =====================================================
 # API KEY
-# -----------------------------
+# =====================================================
 try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
 except Exception:
@@ -25,222 +45,535 @@ except Exception:
 
 genai.configure(api_key=API_KEY)
 
-# -----------------------------
-# 自動取得可用模型
-# -----------------------------
+# =====================================================
+# Gemini 模型設定
+# =====================================================
 @st.cache_resource
-def get_model():
+def get_available_models():
     try:
         models = [
             m.name.replace("models/", "")
             for m in genai.list_models()
             if "generateContent" in m.supported_generation_methods
         ]
-
-        st.sidebar.write("可用模型：")
-        st.sidebar.write(models)
-
-        priority = [
-            "gemini-2.5-flash",
-            "gemini-2.5-pro",
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
-            "gemini-1.5-flash",
-            "gemini-1.5-pro"
-        ]
-
-        for p in priority:
-            if p in models:
-                return p
-
-        if models:
-            return models[0]
-
+        return models
     except Exception as e:
         st.sidebar.error(f"取得模型失敗：{e}")
+        return []
 
-    return None
+available_models = get_available_models()
 
+MODEL_PRIORITY = [
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash-lite-001",
+    "gemini-flash-lite-latest",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash-preview-tts",
+    "gemini-2.5-pro-preview-tts",
+    "gemma-4-26b-a4b-it",
+    "gemma-4-31b-it"
+]
 
-MODEL_NAME = get_model()
+fallback_models = [m for m in MODEL_PRIORITY if m in available_models]
 
-if MODEL_NAME is None:
-    st.error("沒有找到可用 Gemini 模型")
+for m in available_models:
+    if m not in fallback_models:
+        fallback_models.append(m)
+
+if not fallback_models:
+    st.error("目前沒有可用 Gemini 模型")
     st.stop()
 
-st.sidebar.success(f"目前使用模型：{MODEL_NAME}")
+# =====================================================
+# SQLite 快取
+# =====================================================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS answer_cache (
+            key TEXT PRIMARY KEY,
+            question TEXT,
+            answer TEXT,
+            model TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# -----------------------------
+def get_cache(question):
+    key = hashlib.md5(question.strip().encode("utf-8")).hexdigest()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT answer, model FROM answer_cache WHERE key=?", (key,))
+    row = cur.fetchone()
+    conn.close()
+
+    if row:
+        return row[0], row[1]
+    return None, None
+
+def save_cache(question, answer, model):
+    key = hashlib.md5(question.strip().encode("utf-8")).hexdigest()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO answer_cache (key, question, answer, model)
+        VALUES (?, ?, ?, ?)
+    """, (key, question, answer, model))
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# =====================================================
 # PDF 讀取
-# -----------------------------
-def extract_text(file):
-    text = ""
+# =====================================================
+def extract_pdf_pages(file_path):
+    pages = []
 
     try:
-        reader = PdfReader(file)
+        reader = PdfReader(file_path)
 
-        for page in reader.pages:
-            t = page.extract_text()
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text()
 
-            if t:
-                text += t + "\n"
+            if text and text.strip():
+                pages.append({
+                    "file": os.path.basename(file_path),
+                    "page": i + 1,
+                    "text": text.strip()
+                })
 
     except Exception as e:
-        st.error(f"PDF 讀取錯誤：{e}")
+        st.error(f"PDF 讀取錯誤：{file_path}｜{e}")
 
-    return text
+    return pages
 
-# -----------------------------
-# Session 初始化
-# -----------------------------
-if "knowledge" not in st.session_state:
-    st.session_state.knowledge = ""
+# =====================================================
+# 切 Chunk
+# =====================================================
+def split_text_by_page(page_item, chunk_size=1000, overlap=200):
+    text = page_item["text"]
+    chunks = []
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk_text = text[start:end]
 
-if "loaded" not in st.session_state:
-    st.session_state.loaded = False
+        if chunk_text.strip():
+            chunks.append({
+                "file": page_item["file"],
+                "page": page_item["page"],
+                "text": chunk_text.strip()
+            })
 
-# -----------------------------
-# 自動載入 data 資料夾 PDF
-# -----------------------------
-if not st.session_state.loaded:
+        start += chunk_size - overlap
 
-    if os.path.exists("data"):
+    return chunks
 
-        pdfs = [
-            f for f in os.listdir("data")
-            if f.lower().endswith(".pdf")
-        ]
+# =====================================================
+# Embedding
+# =====================================================
+def embed_text(text):
+    result = genai.embed_content(
+        model="models/text-embedding-004",
+        content=text,
+        task_type="retrieval_document"
+    )
+    return np.array(result["embedding"], dtype="float32")
 
-        for pdf in pdfs:
-            path = os.path.join("data", pdf)
-            text = extract_text(path)
+def embed_query(text):
+    result = genai.embed_content(
+        model="models/text-embedding-004",
+        content=text,
+        task_type="retrieval_query"
+    )
+    return np.array(result["embedding"], dtype="float32")
 
-            if text.strip():
-                st.session_state.knowledge += "\n\n"
-                st.session_state.knowledge += f"===== {pdf} =====\n"
-                st.session_state.knowledge += text
+# =====================================================
+# 建立 FAISS 索引
+# =====================================================
+def build_index(chunk_size=1000, overlap=200):
+    all_chunks = []
 
-        if pdfs:
-            st.sidebar.success(f"已自動載入 {len(pdfs)} 個 PDF")
-        else:
-            st.sidebar.warning("data 資料夾內沒有 PDF 檔案")
+    pdf_files = [
+        os.path.join(DATA_DIR, f)
+        for f in os.listdir(DATA_DIR)
+        if f.lower().endswith(".pdf")
+    ]
 
+    if not pdf_files:
+        return None, []
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    for i, pdf in enumerate(pdf_files):
+        status.write(f"正在讀取：{os.path.basename(pdf)}")
+        pages = extract_pdf_pages(pdf)
+
+        for page in pages:
+            chunks = split_text_by_page(
+                page,
+                chunk_size=chunk_size,
+                overlap=overlap
+            )
+            all_chunks.extend(chunks)
+
+        progress.progress((i + 1) / len(pdf_files))
+
+    if not all_chunks:
+        return None, []
+
+    vectors = []
+
+    for i, chunk in enumerate(all_chunks):
+        status.write(f"建立 Embedding：{i + 1}/{len(all_chunks)}")
+        vec = embed_text(chunk["text"])
+        vectors.append(vec)
+        time.sleep(0.05)
+
+    vectors = np.vstack(vectors).astype("float32")
+
+    faiss.normalize_L2(vectors)
+
+    dimension = vectors.shape[1]
+    index = faiss.IndexFlatIP(dimension)
+    index.add(vectors)
+
+    faiss.write_index(index, INDEX_PATH)
+
+    with open(META_PATH, "wb") as f:
+        pickle.dump(all_chunks, f)
+
+    status.success("索引建立完成")
+    progress.empty()
+
+    return index, all_chunks
+
+# =====================================================
+# 載入索引
+# =====================================================
+@st.cache_resource
+def load_index():
+    if not os.path.exists(INDEX_PATH) or not os.path.exists(META_PATH):
+        return None, []
+
+    index = faiss.read_index(INDEX_PATH)
+
+    with open(META_PATH, "rb") as f:
+        metadata = pickle.load(f)
+
+    return index, metadata
+
+# =====================================================
+# 搜尋相關 Chunk
+# =====================================================
+def search_chunks(question, index, metadata, top_k=40):
+    q_vec = embed_query(question).reshape(1, -1).astype("float32")
+    faiss.normalize_L2(q_vec)
+
+    scores, ids = index.search(q_vec, top_k)
+
+    results = []
+
+    for score, idx in zip(scores[0], ids[0]):
+        if idx == -1:
+            continue
+
+        item = metadata[idx]
+        results.append({
+            "score": float(score),
+            "file": item["file"],
+            "page": item["page"],
+            "text": item["text"]
+        })
+
+    return results
+
+# =====================================================
+# Gemini 自動跳模型
+# =====================================================
+def generate_with_fallback(prompt_text, selected_model="AUTO"):
+    if selected_model != "AUTO":
+        models_to_try = [selected_model]
     else:
-        st.sidebar.warning("尚未建立 data 資料夾")
+        models_to_try = fallback_models
 
-    st.session_state.loaded = True
+    errors = []
 
-# -----------------------------
-# Sidebar 文件中心
-# -----------------------------
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt_text)
+
+            if hasattr(response, "text") and response.text:
+                return response.text, model_name
+
+            answer = ""
+
+            if hasattr(response, "candidates"):
+                for c in response.candidates:
+                    if c.content:
+                        for p in c.content.parts:
+                            if hasattr(p, "text"):
+                                answer += p.text
+
+            if answer.strip():
+                return answer, model_name
+
+            errors.append(f"{model_name}：沒有回傳內容")
+
+        except Exception as e:
+            err = str(e)
+            errors.append(f"{model_name}：{err}")
+
+            if "429" in err or "quota" in err.lower() or "RESOURCE_EXHAUSTED" in err:
+                time.sleep(2)
+                continue
+
+            continue
+
+    return "所有模型都無法使用。\n\n錯誤紀錄：\n" + "\n\n".join(errors), None
+
+# =====================================================
+# 建立回答 Prompt
+# =====================================================
+def build_prompt(question, search_results):
+    context = ""
+
+    for i, r in enumerate(search_results, 1):
+        context += f"""
+【資料 {i}】
+來源：{r["file"]}｜第 {r["page"]} 頁
+相關分數：{r["score"]:.4f}
+
+內容：
+{r["text"]}
+"""
+
+    prompt = f"""
+你是一位技術服務專家，熟悉技銷、金技、鋁陽極染色、客戶拜訪、出差經驗整理與技術文件分析。
+
+以下是從公司 PDF 出差文件中搜尋出的相關內容：
+
+==============================
+{context}
+==============================
+
+使用者問題：
+{question}
+
+請依照以下規則回答：
+
+1. 優先根據 PDF 內容回答。
+2. 如果 PDF 內容不足，請先寫：「目前PDF資料中沒有完整資訊。」
+3. 不可以亂編 PDF 沒有的客戶名稱、公司名稱、數據、年份。
+4. 若需要補充，可以用「依照一般技術服務經驗補充」的方式說明。
+5. 回答請使用繁體中文。
+6. 回答要完整、清楚、條列整理。
+7. 如果問題與出差注意事項有關，請分成：
+   - 出差前準備
+   - 拜訪客戶時注意事項
+   - 技術交流注意事項
+   - 當地文化與溝通注意事項
+   - 出差後紀錄與追蹤
+8. 最後請列出「參考來源」，格式如下：
+   - 檔名｜第 X 頁
+"""
+
+    return prompt
+
+# =====================================================
+# Sidebar
+# =====================================================
 with st.sidebar:
+    st.header("⚙️ 模型設定")
 
-    st.header("文件中心")
+    model_mode = st.radio(
+        "模型模式",
+        ["自動跳模型", "手動指定模型"]
+    )
 
-    files = st.file_uploader(
-        "額外上傳 PDF",
+    if model_mode == "手動指定模型":
+        selected_model = st.selectbox(
+            "選擇模型",
+            available_models,
+            index=0
+        )
+    else:
+        selected_model = "AUTO"
+
+    st.write("目前可用模型：")
+    st.write(available_models)
+
+    st.divider()
+
+    st.header("📁 文件中心")
+
+    uploaded_files = st.file_uploader(
+        "上傳 PDF",
         type=["pdf"],
         accept_multiple_files=True
     )
 
-    if files:
+    if uploaded_files:
+        for file in uploaded_files:
+            save_path = os.path.join(DATA_DIR, file.name)
 
-        for f in files:
-            uploaded_text = extract_text(f)
+            with open(save_path, "wb") as f:
+                f.write(file.getbuffer())
 
-            if uploaded_text.strip():
-                st.session_state.knowledge += "\n\n"
-                st.session_state.knowledge += f"===== {f.name} =====\n"
-                st.session_state.knowledge += uploaded_text
-
-        st.success("新增成功")
+        st.success("PDF 已上傳，請重新建立索引")
 
     st.divider()
 
-    st.write("目前知識庫字數：")
-    st.write(len(st.session_state.knowledge))
+    chunk_size = st.slider(
+        "Chunk 文字長度",
+        min_value=500,
+        max_value=2000,
+        value=1000,
+        step=100
+    )
 
-# -----------------------------
+    overlap = st.slider(
+        "Chunk 重疊字數",
+        min_value=50,
+        max_value=500,
+        value=200,
+        step=50
+    )
+
+    top_k = st.slider(
+        "搜尋段落數量 Top K",
+        min_value=10,
+        max_value=120,
+        value=50,
+        step=10
+    )
+
+    use_cache = st.checkbox("啟用相同問題快取", value=True)
+
+    if st.button("🔄 重新建立索引"):
+        if os.path.exists(INDEX_PATH):
+            os.remove(INDEX_PATH)
+
+        if os.path.exists(META_PATH):
+            os.remove(META_PATH)
+
+        st.cache_resource.clear()
+
+        with st.spinner("正在重新建立索引，第一次會比較久..."):
+            build_index(chunk_size=chunk_size, overlap=overlap)
+
+        st.success("索引已重新建立，請重新整理頁面")
+
+    st.divider()
+
+    pdf_count = len([
+        f for f in os.listdir(DATA_DIR)
+        if f.lower().endswith(".pdf")
+    ])
+
+    st.write(f"PDF 數量：{pdf_count}")
+
+# =====================================================
+# 載入索引
+# =====================================================
+index, metadata = load_index()
+
+if index is None or not metadata:
+    st.warning("目前尚未建立索引。請先把 PDF 放到 data 資料夾，或從左側上傳 PDF，然後按「重新建立索引」。")
+else:
+    st.success(f"知識庫已載入，共 {len(metadata)} 個段落")
+
+# =====================================================
+# Session
+# =====================================================
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# =====================================================
 # 顯示聊天紀錄
-# -----------------------------
+# =====================================================
 for msg in st.session_state.messages:
-
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# -----------------------------
+# =====================================================
 # Chat
-# -----------------------------
-prompt = st.chat_input("請輸入問題...")
+# =====================================================
+question = st.chat_input("請輸入問題...")
 
-if prompt:
-
-    st.session_state.messages.append(
-        {
-            "role": "user",
-            "content": prompt
-        }
-    )
+if question:
+    st.session_state.messages.append({
+        "role": "user",
+        "content": question
+    })
 
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(question)
 
     with st.chat_message("assistant"):
-
         with st.spinner("AI 分析中..."):
 
-            MAX_CHARS = 800000
-            current_knowledge = st.session_state.knowledge[-MAX_CHARS:]
+            if index is None or not metadata:
+                answer = "目前尚未建立 PDF 知識庫索引，請先上傳 PDF 並重新建立索引。"
+                used_model = None
 
-            system_prompt = f"""
-你是一位技術服務專家。
-以下是公司所有技術出差文件。
+            else:
+                if use_cache:
+                    cached_answer, cached_model = get_cache(question)
 
-==============================
-{current_knowledge}
-==============================
+                    if cached_answer:
+                        answer = cached_answer
+                        used_model = f"{cached_model}｜快取"
+                    else:
+                        results = search_chunks(
+                            question,
+                            index,
+                            metadata,
+                            top_k=top_k
+                        )
 
-請依照以上內容回答。
+                        full_prompt = build_prompt(question, results)
 
-回答規則：
-1. 如果文件中有答案，請優先根據 PDF 內容回答。
-2. 如果文件中沒有答案，請先回答：「目前PDF資料中沒有相關資訊。」
-3. 若需要補充，請再依照你的專業知識補充。
-4. 回答請使用繁體中文。
-5. 回答請盡量完整，並使用條列整理。
-"""
+                        answer, used_model = generate_with_fallback(
+                            full_prompt,
+                            selected_model=selected_model
+                        )
 
-            model = genai.GenerativeModel(MODEL_NAME)
+                        if answer and used_model:
+                            save_cache(question, answer, used_model)
 
-            try:
-                response = model.generate_content(
-                    contents=system_prompt + "\n\n使用者問題：\n" + prompt
-                )
-
-                if hasattr(response, "text"):
-                    answer = response.text
-                elif hasattr(response, "candidates"):
-                    answer = ""
-
-                    for c in response.candidates:
-                        if c.content:
-                            for p in c.content.parts:
-                                if hasattr(p, "text"):
-                                    answer += p.text
                 else:
-                    answer = "AI 沒有回傳任何內容。"
+                    results = search_chunks(
+                        question,
+                        index,
+                        metadata,
+                        top_k=top_k
+                    )
 
-            except Exception as e:
-                answer = f"AI 發生錯誤：{str(e)}"
+                    full_prompt = build_prompt(question, results)
+
+                    answer, used_model = generate_with_fallback(
+                        full_prompt,
+                        selected_model=selected_model
+                    )
 
             st.markdown(answer)
 
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": answer
-                }
-            )
+            if used_model:
+                st.caption(f"本次使用模型：{used_model}")
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer
+            })
