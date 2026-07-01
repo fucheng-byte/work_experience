@@ -1,12 +1,11 @@
 import os
+import time
 import streamlit as st
 import google.generativeai as genai
 from pypdf import PdfReader
-import numpy as np
-import re
 
 st.set_page_config(page_title="技銷金技出差經驗分享", page_icon="🚀", layout="wide")
-st.title("🚀 技銷金技出差經驗分享 (均衡檢索版)")
+st.title("🚀 技銷金技出差經驗分享 (全文深度精讀版)")
 
 if "GEMINI_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
@@ -16,40 +15,31 @@ else:
 
 @st.cache_resource
 def get_best_models():
+    """自動偵測最適合處理超長全文的對話模型"""
     try:
         available = [m for m in genai.list_models()]
-        embed_models = [m.name for m in available if 'embedContent' in m.supported_generation_methods]
         chat_models = [m.name for m in available if 'generateContent' in m.supported_generation_methods]
         
-        embed_model = embed_models[0] if embed_models else "models/text-embedding-004"
-        if "models/text-embedding-004" in embed_models: 
-            embed_model = "models/text-embedding-004"
-            
-        primary_chat = chat_models[0].replace("models/", "") if chat_models else "gemini-1.5-flash"
+        primary_chat = "gemini-2.5-flash"
         if "models/gemini-2.5-flash" in chat_models: 
             primary_chat = "gemini-2.5-flash"
         elif "models/gemini-1.5-flash" in chat_models: 
             primary_chat = "gemini-1.5-flash"
+        else:
+            primary_chat = chat_models[0].replace("models/", "") if chat_models else "gemini-1.5-flash"
             
-        fallback_chat = primary_chat
-        for m in chat_models:
-            m_name = m.replace("models/", "")
-            if m_name != primary_chat and "flash" in m_name:
-                fallback_chat = m_name
-                break
-        if fallback_chat == primary_chat and len(chat_models) > 1:
-            fallback_chat = chat_models[-1].replace("models/", "")
-            
-        return embed_model, primary_chat, fallback_chat
+        fallback_chat = "gemini-1.5-flash" if "models/gemini-1.5-flash" in chat_models else primary_chat
+        return primary_chat, fallback_chat
     except Exception:
-        return "models/text-embedding-004", "gemini-1.5-flash", "gemini-1.5-flash"
+        return "gemini-2.5-flash", "gemini-1.5-flash"
 
-EMBED_MODEL, PRIMARY_CHAT, FALLBACK_CHAT = get_best_models()
+PRIMARY_CHAT, FALLBACK_CHAT = get_best_models()
 
-def extract_text_from_pdf(pdf_file):
+def extract_text_from_pdf(file_path):
+    """一字不漏地完整萃取整份 PDF 的全文本"""
     text = ""
     try:
-        reader = PdfReader(pdf_file)
+        reader = PdfReader(file_path)
         for page in reader.pages:
             content = page.extract_text()
             if content:
@@ -58,221 +48,123 @@ def extract_text_from_pdf(pdf_file):
         pass
     return text
 
-def split_text(text, chunk_size=800, chunk_overlap=150):
-    chunks = []
-    if not text:
-        return chunks
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        if end >= len(text):
-            break
-        start += chunk_size - chunk_overlap
-    return chunks
-
-def cosine_similarity(v1, v2):
-    dot_prod = np.dot(v1, v2)
-    norm1 = np.linalg.norm(v1)
-    norm2 = np.linalg.norm(v2)
-    if norm1 == 0 or norm2 == 0:
-        return 0
-    return dot_prod / (norm1 * norm2)
-
-def get_dir_mod_time(data_dir):
-    if not os.path.exists(data_dir):
-        return 0
-    files = os.listdir(data_dir)
-    pdf_files = [f for f in files if f.lower().endswith('.pdf')]
-    if not pdf_files:
-        return 0
-    return max(os.path.getmtime(os.path.join(data_dir, f)) for f in pdf_files)
-
-@st.cache_data(show_spinner=False)
-def build_knowledge_base(data_dir, mod_time):
-    database = []
-    if not os.path.exists(data_dir):
-        return database
-    
-    pdf_files = [f for f in os.listdir(data_dir) if f.lower().endswith('.pdf')]
-    if not pdf_files:
-        return database
-    
-    all_chunks = []
-    for filename in pdf_files:
-        file_path = os.path.join(data_dir, filename)
-        text = extract_text_from_pdf(file_path)
-        chunks = split_text(text)
-        for chunk in chunks:
-            search_content = f"報告檔名：{filename}\n內容：{chunk}"
-            all_chunks.append({"text": chunk, "source": filename, "search_content": search_content})
-    
-    if not all_chunks:
-        return database
-    
-    texts_to_embed = [c["search_content"] for c in all_chunks]
-    batch_size = 50
-    embeddings = []
-    
-    for i in range(0, len(texts_to_embed), batch_size):
-        batch = texts_to_embed[i:i+batch_size]
-        try:
-            res = genai.embed_content(model=EMBED_MODEL, content=batch)
-            embeddings.extend(res['embedding'])
-        except Exception:
-            for _ in batch:
-                embeddings.append([0.0]*768)
-            
-    for chunk, emb in zip(all_chunks, embeddings):
-        if any(v != 0.0 for v in emb): 
-            chunk["embedding"] = emb
-            database.append(chunk)
-            
-    return database
-
-def extract_keywords(prompt):
-    stop_words = [
-        "幫我", "找", "的", "報告", "請問", "有沒有", "出差", "資料", "哪些", 
-        "什麼", "關於", "整理", "所有", "人員", "沒有", "嗎", "紀錄", "呢",
-        "為何", "為什麼", "查", "一下", "怎麼", "找不到", "歷年來", "次數", "地區", "趨勢"
-    ]
-    clean_prompt = prompt
-    for sw in stop_words:
-        clean_prompt = clean_prompt.replace(sw, " ")
-        
-    clean_prompt = re.sub(r'[^\w\s]', ' ', clean_prompt)
-    words = clean_prompt.split()
-    return [w for w in words if len(w) >= 2]
-
 data_dir = "data"
-current_mod_time = get_dir_mod_time(data_dir)
-
-if "db_initialized" not in st.session_state:
-    with st.spinner("🔄 正在初始化企業級知識庫（請耐心等候...）"):
-        st.session_state.vector_db = build_knowledge_base(data_dir, current_mod_time)
-        st.session_state.db_initialized = True
-else:
-    if "vector_db" not in st.session_state:
-        st.session_state.vector_db = build_knowledge_base(data_dir, current_mod_time)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 with st.sidebar:
     st.subheader("📁 文件中心")
-    file_count = len([f for f in os.listdir(data_dir) if f.lower().endswith('.pdf')]) if os.path.exists(data_dir) else 0
+    pdf_files = [f for f in os.listdir(data_dir) if f.lower().endswith('.pdf')] if os.path.exists(data_dir) else []
+    file_count = len(pdf_files)
     
-    if "vector_db" in st.session_state and len(st.session_state.vector_db) > 0:
-        st.success(f"✅ 系統已自動索引 {file_count} 份合併報告")
-        st.info(f"🚀 主力 AI: {PRIMARY_CHAT}\n\n🛡️ 備援 AI: {FALLBACK_CHAT}")
+    if file_count > 0:
+        st.success(f"✅ 成功辨識 {file_count} 份同仁合併大檔案。")
+        st.info("💡 目前運行模式：【100% 全文深度精讀模式】\n\n系統已關閉語意猜測。每次提問，AI 都會老老實實把左下角所有檔案從頭到尾讀完，確保真實性與廣泛性！")
+        for f in pdf_files:
+            st.text(f"📄 {f}")
     else:
-        st.warning(f"⚠️ 找到 {file_count} 份報告，但索引建立失敗。")
+        st.warning("⚠️ data 資料夾內找不到任何 PDF 檔案。")
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-if prompt := st.chat_input("請輸入問題..."):
+if prompt := st.chat_input("請輸入宏觀盤點或特定查詢問題... (AI 將逐一精讀所有大檔案，約需 1 分鐘)"):
     with st.chat_message("user"):
         st.markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("assistant"):
-        if not st.session_state.vector_db:
-            st.error("系統資料庫目前為空，請嘗試清除快取。")
+        if file_count == 0:
+            st.error("沒有任何檔案可供深度精讀。")
             st.stop()
             
-        with st.spinner(f"🔍 正在啟動『均衡檢索機制』，確保不遺漏任何人員檔案..."):
-            try:
-                q_res = genai.embed_content(model=EMBED_MODEL, content=[prompt])
-                q_emb = q_res['embedding'][0]
+        pdf_files.sort() # 確保每次讀取的檔案順序一致
+        intermediate_results = ""
+        
+        # Streamlit 畫面上動態展示進度條與即時播報區
+        my_bar = st.progress(0, text="🚀 啟動跨檔案深度全文大盤點...")
+        live_output = st.empty()
+        
+        try:
+            for i, filename in enumerate(pdf_files):
+                my_bar.progress((i) / file_count, text=f"🔍 正在 100% 全文精讀分析：【{filename}】(每份約需 10 秒，請耐心等候)...")
+                file_path = os.path.join(data_dir, filename)
                 
-                keywords = extract_keywords(prompt)
+                # 讀取該同仁大檔案的「完整全文」
+                file_text = extract_text_from_pdf(file_path)
                 
-                scored_chunks = []
-                for chunk in st.session_state.vector_db:
-                    vec_score = cosine_similarity(q_emb, chunk["embedding"])
-                    keyword_boost = 0.0
-                    for kw in keywords:
-                        if kw in chunk['source']:
-                            keyword_boost += 0.4  
-                        if kw in chunk['text']:
-                            keyword_boost += 0.2  
-                    
-                    final_score = vec_score + keyword_boost
-                    scored_chunks.append((final_score, chunk))
+                if not file_text.strip():
+                    continue
                 
-                # 依分數排序
-                scored_chunks.sort(key=lambda x: x[0], reverse=True)
+                # 針對單一檔案的全文下達最嚴格的數據萃取指令
+                extract_prompt = (
+                    f"你是一個極度精準的數據與商業資料萃取專家。現在請你『從頭到尾、逐字逐句』完整閱讀以下這份同仁的出差報告大合集。\n"
+                    f"請針對使用者的問題：『{prompt}』，將這份報告中所有相關的真實數據、出差次數、時間、地點、拜訪廠商、經濟趨勢等細節，毫無遺漏地全部盤點並記錄下來。\n"
+                    f"【鐵律】：請保持資料的 100% 真實性，絕對不可自己捏造、腦補或省略任何數據。如果這份報告中完全找不到與問題相關的任何資訊，請只回答『NO_MATCH』，不要輸出任何贅字。\n\n"
+                    f"【當前審查檔案名稱】：{filename}\n"
+                    f"【檔案全文內容】:\n{file_text}"
+                )
                 
-                # ==========================================
-                # 🛡️ 核心修改：各檔案「保障名額」機制
-                # ==========================================
-                top_k = []
-                file_chunk_count = {} # 用來記錄每份檔案被抽了幾段
+                # 呼叫 AI (內建不當機雙引擎備援)
+                try:
+                    model = genai.GenerativeModel(PRIMARY_CHAT)
+                    response = model.generate_content(extract_prompt)
+                    res_text = response.text
+                except Exception:
+                    try:
+                        model = genai.GenerativeModel(FALLBACK_CHAT)
+                        response = model.generate_content(extract_prompt)
+                        res_text = response.text
+                    except Exception:
+                        res_text = "⚠️ 該檔案因雲端 API 超載暫時無法讀取。"
                 
-                for score, chunk in scored_chunks:
-                    # 降低門檻到 0.1，確保模糊問題也能撈到資料
-                    if score > 0.1:
-                        source_file = chunk['source']
-                        # 限制每份檔案【最多只能提供 12 個段落】
-                        if file_chunk_count.get(source_file, 0) < 12:
-                            top_k.append((score, chunk))
-                            file_chunk_count[source_file] = file_chunk_count.get(source_file, 0) + 1
-                    
-                    # 總共收集 60 段就停止
-                    if len(top_k) >= 60:
-                        break
-                
-                context_str = ""
-                sources = set()
-                for score, chunk in top_k:
-                    context_str += f"[來源檔案: {chunk['source']}]\n{chunk['text']}\n\n"
-                    sources.add(chunk['source'])
-                
-                if context_str:
-                    full_prompt = (
-                        "你是一個專門分析公司內部『技銷金技出差經驗與廠商資料』的高階 AI 智能助理。\n"
-                        "請根據以下從數百份檔案中精確檢索出來的【相關知識庫段落】內容，全面、客觀地回答使用者的問題。\n"
-                        "如果使用者要求『整理所有人』或提出『廣泛的分析』，請務必檢視所有提供的來源檔案，確保整理出不同人員的資料，不要只偏重某一個人。\n"
-                        "在回答時，請務必主動提及你是從哪些來源檔案中找到這些資訊的。\n\n"
-                        f"【精確檢索的知識庫段落】:\n{context_str}\n"
-                        f"【使用者問題】: {prompt}"
-                    )
+                # 如果這份檔案裡有挖到寶，就記錄下來並即時播報給使用者看
+                if "NO_MATCH" not in res_text.upper() and res_text.strip():
+                    intermediate_results += f"\n\n============================\n"
+                    intermediate_results += f"📄 來自檔案【{filename}】的 100% 真實盤點紀錄：\n"
+                    intermediate_results += f"============================\n{res_text}\n"
+                    live_output.info(f"👀 **即時播報：AI 剛剛讀完了新檔案！目前累積搜集到的真實線索：**\n\n{intermediate_results}")
                 else:
-                    full_prompt = (
-                        f"使用者問了問題：「{prompt}」，但目前系統在檔案中沒有檢索到直接相關的段落。\n"
-                        "請客氣地回答：'抱歉，目前的出差經驗知識庫中沒有檢索到直接相關的資料。您可以嘗試直接輸入人名或更明確的關鍵字。'"
-                    )
+                    live_output.warning(f"👀 播報：檔案【{filename}】中沒有找到與問題相關的紀錄，繼續精讀下一份...")
                 
-                used_ai = ""
-                ai_reply = ""
+                # 每次精讀完一份大檔案，強制休息 8 秒，極其安全地保護 TPM/RPM 免費限額
+                if i < file_count - 1:
+                    time.sleep(8)
+            
+            my_bar.progress(1.0, text="✨ 所有大檔案已 100% 深度精讀完畢！正在進行最終的大數據融合總結...")
+            time.sleep(2)
+            
+            # 第二階段：將所有人各別盤點出來的「純真實線索」融合成最終大報告
+            if intermediate_results.strip():
+                final_prompt = (
+                    f"你是一個專門分析公司內部『出差經驗與商業情報』的高階智能特助。\n"
+                    f"使用者問了一個全局大宏觀的問題：『{prompt}』。\n"
+                    f"以下是我讓系統把資料夾中『每一份合併大檔案從第一字到最後一字』全部一字不漏精讀後，所撈出來的 100% 真實各檔案盤點碎片。\n"
+                    f"請你將這些碎片完美地融合成一份最終的、結構極其清晰、條理分明的大數據總盤點報告。報告中必須包含所有人（不可以漏掉任何一份檔案裡的同仁）、真實的次數加總、去過的地點、拜訪的廠商以及各地的經濟趨勢分析。\n"
+                    f"【嚴格要求】：必須展現出 100% 的真實性，數據是多少就寫多少，並且在提及數據時，必須註明資料是源自哪一個檔案，以便同仁查核。\n\n"
+                    f"【各檔案 100% 真實盤點碎片集】:\n{intermediate_results}"
+                )
                 
                 try:
                     model = genai.GenerativeModel(PRIMARY_CHAT)
-                    response = model.generate_content(full_prompt)
-                    used_ai = PRIMARY_CHAT
-                    ai_reply = response.text
-                except Exception as e1:
-                    if PRIMARY_CHAT != FALLBACK_CHAT:
-                        st.warning(f"⚠️ `{PRIMARY_CHAT}` 額度滿載，自動切換至備援 `{FALLBACK_CHAT}`...")
-                        try:
-                            model = genai.GenerativeModel(FALLBACK_CHAT)
-                            response = model.generate_content(full_prompt)
-                            used_ai = FALLBACK_CHAT
-                            ai_reply = response.text
-                        except Exception as e2:
-                            st.error("🚨 您的金鑰今日『所有免費額度』皆已耗盡。請更換 API Key！")
-                            st.stop()
-                    else:
-                        st.error("🚨 您的金鑰今日免費額度已完全耗盡。請更換 API Key！")
-                        st.stop()
-                
-                if sources:
-                    ai_reply += f"\n\n---\n**🔍 本次回答參考的原始檔案：** (由 {used_ai} 生成)\n" + "\n".join([f"- 📄 {s}" for s in sources])
-                
-                st.markdown(ai_reply)
-                st.session_state.messages.append({"role": "assistant", "content": ai_reply})
-                
-            except Exception as e:
-                st.error(f"系統發生不可預期的錯誤，請稍後重試。錯誤訊息: {str(e)}")
+                    final_response = model.generate_content(final_prompt)
+                except Exception:
+                    model = genai.GenerativeModel(FALLBACK_CHAT)
+                    final_response = model.generate_content(final_prompt)
+                    
+                ai_reply = final_response.text
+            else:
+                ai_reply = f"抱歉，我剛剛從頭到尾、一字不漏地精讀了資料夾內所有的合併報告，裡面完全找不到任何與『{prompt}』相關的蛛絲馬跡喔！"
+            
+            my_bar.empty()
+            live_output.empty()
+            
+            st.markdown(ai_reply)
+            st.session_state.messages.append({"role": "assistant", "content": ai_reply})
+            
+        except Exception as e:
+            my_bar.empty()
+            live_output.empty()
+            st.error(f"系統發生不可預期的錯誤，請稍後重試。錯誤訊息: {str(e)}")
