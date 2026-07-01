@@ -207,81 +207,46 @@ if prompt:
 
     with st.chat_message("assistant"):
 
-        with st.spinner("AI分析中..."):
-
-            system_prompt=f"""
-
+                with st.spinner("AI分析中..."):
+            # 1. 確保知識庫已切割且準備好
+            MAX_CHARS = 800000
+            current_knowledge = st.session_state.knowledge[-MAX_CHARS:]
+            
+            system_prompt = f"""
 你是一位技術服務專家。
-
 以下是公司所有技術出差文件。
-
 ==============================
-
-MAX_CHARS = 800000
-
-knowledge = st.session_state.knowledge[-MAX_CHARS:]
-{knowledge}
+{current_knowledge}
 ==============================
-
-請依照以上內容回答。
-
-如果文件中沒有答案，
-
-請先回答：
-
-"目前PDF資料中沒有相關資訊。"
-
-然後再依照你的專業知識補充。
-
-回答請盡量完整。
-
-使用繁體中文。
-
-使用條列整理。
-
+請依照以上內容回答。如果文件中沒有答案，請先回答：「目前PDF資料中沒有相關資訊。」然後再依照你的專業知識補充。
+回答請盡量完整，使用繁體中文，並使用條列整理。
 """
-
-           try:
-    response = model.generate_content(
-        contents=system_prompt + "\n\n使用者問題：\n" + prompt
-    )
-    
-    # 確保 answer 初始化
-    answer = ""
-    
-    # 嘗試直接獲取 text，若發生錯誤則透過候選集解析
-    try:
-        answer = response.text
-    except Exception:
-        if hasattr(response, "candidates"):
-            for c in response.candidates:
-                if c.content:
-                    for p in c.content.parts:
-                        if hasattr(p, "text"):
-                            answer += p.text
-
-except Exception as e:
-    print(f"發生錯誤: {e}")
-    answer = ""
-
-# 最後檢查 answer 是否為空
-if answer == "":
-    answer = "AI 沒有回傳任何內容。"
-
+            # 2. 初始化模型物件
+            model = genai.GenerativeModel(MODEL_NAME)
+            
+            # 3. 執行生成並處理錯誤
+            try:
+                response = model.generate_content(
+                    contents=system_prompt + "\n\n使用者問題：\n" + prompt
+                )
+                
+                # 解析內容
+                if hasattr(response, "text"):
+                    answer = response.text
+                elif hasattr(response, "candidates"):
+                    answer = ""
+                    for c in response.candidates:
+                        if c.content:
+                            for p in c.content.parts:
+                                if hasattr(p, "text"):
+                                    answer += p.text
+                else:
+                    answer = "AI 沒有回傳任何內容。"
             except Exception as e:
+                answer = f"AI發生錯誤：{str(e)}"
 
-                answer=f"AI發生錯誤：{e}"
-
+            # 4. 顯示與記錄
             st.markdown(answer)
-
             st.session_state.messages.append(
-
-                {
-
-                    "role":"assistant",
-
-                    "content":answer
-
-                }
-
+                {"role": "assistant", "content": answer}
             )
