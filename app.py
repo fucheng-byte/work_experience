@@ -241,25 +241,32 @@ knowledge = st.session_state.knowledge[-MAX_CHARS:]
 
 """
 
-            try:
+           try:
+    response = model.generate_content(
+        contents=system_prompt + "\n\n使用者問題：\n" + prompt
+    )
+    
+    # 確保 answer 初始化
+    answer = ""
+    
+    # 嘗試直接獲取 text，若發生錯誤則透過候選集解析
+    try:
+        answer = response.text
+    except Exception:
+        if hasattr(response, "candidates"):
+            for c in response.candidates:
+                if c.content:
+                    for p in c.content.parts:
+                        if hasattr(p, "text"):
+                            answer += p.text
 
-                response = model.generate_content(
-    contents=system_prompt + "\n\n使用者問題：\n" + prompt
-)
-                try:
-    answer = response.text
-except Exception:
+except Exception as e:
+    print(f"發生錯誤: {e}")
     answer = ""
 
-    if hasattr(response, "candidates"):
-        for c in response.candidates:
-            if c.content:
-                for p in c.content.parts:
-                    if hasattr(p, "text"):
-                        answer += p.text
-
-    if answer == "":
-        answer = "AI 沒有回傳任何內容。"
+# 最後檢查 answer 是否為空
+if answer == "":
+    answer = "AI 沒有回傳任何內容。"
 
             except Exception as e:
 
