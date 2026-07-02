@@ -198,7 +198,7 @@ def extract_pdf_pages(file_path):
 # =====================================================
 # 切 Chunk
 # =====================================================
-def split_text_by_page(page_item, chunk_size=2000, overlap=50):
+def split_text_by_page(page_item, chunk_size=1000, overlap=50): # 預設改為 1000
     text = page_item["text"]
     chunks = []
 
@@ -220,15 +220,26 @@ def split_text_by_page(page_item, chunk_size=2000, overlap=50):
     return chunks
 
 # =====================================================
-# Embedding
+# --- 修改區塊：批次 Embedding 與 退避重試機制 ---
 # =====================================================
-def embed_document(text):
-    result = genai.embed_content(
-        model=EMBEDDING_MODEL,
-        content=text,
-        task_type="retrieval_document"
-    )
-    return np.array(result["embedding"], dtype="float32")
+def embed_documents_batch(texts, max_retries=5):
+    """將多筆文字一次送給 Gemini 轉換為向量，並包含 429 防護"""
+    for attempt in range(max_retries):
+        try:
+            result = genai.embed_content(
+                model=EMBEDDING_MODEL,
+                content=texts,
+                task_type="retrieval_document"
+            )
+            return np.array(result["embedding"], dtype="float32")
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg:
+                wait_time = (2 ** attempt) * 5  # 5秒, 10秒, 20秒...
+                time.sleep(wait_time)
+            else:
+                raise e
+    raise Exception("Embedding 失敗次數過多，請稍後再試或檢查 API 額度。")
 
 def embed_question(text):
     result = genai.embed_content(
@@ -241,7 +252,7 @@ def embed_question(text):
 # =====================================================
 # 建立索引
 # =====================================================
-def build_index(chunk_size=2000, overlap=50):
+def build_index(chunk_size=1000, overlap=50):
     pdf_files = [
         os.path.join(DATA_DIR, f)
         for f in os.listdir(DATA_DIR)
@@ -276,20 +287,24 @@ def build_index(chunk_size=2000, overlap=50):
         st.warning("PDF 沒有讀取到文字，可能是掃描圖片型 PDF")
         return [], None
 
+    # --- 修改區塊：使用批次處理大幅降低 API 請求次數 ---
+    BATCH_SIZE = 100
     vectors = []
     embedded_chunks = []
 
-    for i, chunk in enumerate(all_chunks):
-        status.write(f"正在建立 Embedding：{i + 1}/{len(all_chunks)}")
+    for i in range(0, len(all_chunks), BATCH_SIZE):
+        batch = all_chunks[i:i + BATCH_SIZE]
+        batch_texts = [chunk["text"] for chunk in batch]
+        
+        status.write(f"正在建立 Embedding：批次 {i // BATCH_SIZE + 1} (處理進度: {min(i + BATCH_SIZE, len(all_chunks))}/{len(all_chunks)})")
 
         try:
-            vec = embed_document(chunk["text"])
-            vectors.append(vec)
-            embedded_chunks.append(chunk)
-            time.sleep(0.12)
-
+            batch_vecs = embed_documents_batch(batch_texts)
+            vectors.extend(batch_vecs)
+            embedded_chunks.extend(batch)
+            time.sleep(1.5)  # 批次之間稍微停頓保護 API
         except Exception as e:
-            st.warning(f"第 {i + 1} 段 Embedding 失敗，已略過：{e}")
+            st.error(f"批次 {i // BATCH_SIZE + 1} Embedding 失敗，已略過：{e}")
             continue
 
     if not vectors:
@@ -329,7 +344,7 @@ def load_index():
 # =====================================================
 # 搜尋 Chunk
 # =====================================================
-def search_chunks(question, metadata, embeddings, top_k=50):
+def search_chunks(question, metadata, embeddings, top_k=10): # 預設改小
     q_vec = embed_question(question).astype("float32")
     q_vec = q_vec / max(np.linalg.norm(q_vec), 1e-10)
 
@@ -352,9 +367,9 @@ def search_chunks(question, metadata, embeddings, top_k=50):
     return results
 
 # =====================================================
-# Gemini 自動跳模型
+# --- 修改區塊：Gemini 自動跳模型與指數退避重試 ---
 # =====================================================
-def generate_with_fallback(prompt_text, selected_model="AUTO"):
+def generate_with_fallback(prompt_text, selected_model="AUTO", max_retries=3):
     if selected_model != "AUTO":
         models_to_try = [selected_model]
     else:
@@ -363,36 +378,39 @@ def generate_with_fallback(prompt_text, selected_model="AUTO"):
     errors = []
 
     for model_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt_text)
+        for attempt in range(max_retries):
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(prompt_text)
 
-            if hasattr(response, "text") and response.text:
-                return response.text, model_name
+                if hasattr(response, "text") and response.text:
+                    return response.text, model_name
 
-            answer = ""
+                answer = ""
 
-            if hasattr(response, "candidates"):
-                for c in response.candidates:
-                    if c.content:
-                        for p in c.content.parts:
-                            if hasattr(p, "text"):
-                                answer += p.text
+                if hasattr(response, "candidates"):
+                    for c in response.candidates:
+                        if c.content:
+                            for p in c.content.parts:
+                                if hasattr(p, "text"):
+                                    answer += p.text
 
-            if answer.strip():
-                return answer, model_name
+                if answer.strip():
+                    return answer, model_name
 
-            errors.append(f"{model_name}：沒有回傳內容")
+                errors.append(f"{model_name}：沒有回傳內容")
+                break # 沒有內容的錯誤不重試，直接換模型
 
-        except Exception as e:
-            err = str(e)
-            errors.append(f"{model_name}：{err}")
-
-            if "429" in err or "quota" in err.lower() or "RESOURCE_EXHAUSTED" in err:
-                time.sleep(2)
-                continue
-
-            continue
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "quota" in err.lower() or "RESOURCE_EXHAUSTED" in err:
+                    wait_time = (2 ** attempt) * 2  # 發生限制時等待 2秒, 4秒, 8秒
+                    time.sleep(wait_time)
+                    continue # 繼續當前模型的下一次嘗試
+                
+                # 其他錯誤直接記錄並換下一個模型
+                errors.append(f"{model_name}：{err}")
+                break
 
     return "所有模型都無法使用。\n\n錯誤紀錄：\n" + "\n\n".join(errors), None
 
@@ -502,11 +520,12 @@ with st.sidebar:
 
     st.subheader("索引設定")
 
+    # --- 修改區塊：調降 UI 預設值以節省 Token ---
     chunk_size = st.slider(
         "Chunk 文字長度",
         min_value=500,
         max_value=3000,
-        value=2000,
+        value=1000, # 預設從 2000 降為 1000
         step=100
     )
 
@@ -520,10 +539,10 @@ with st.sidebar:
 
     top_k = st.slider(
         "搜尋段落數量 Top K",
-        min_value=10,
-        max_value=120,
-        value=50,
-        step=10
+        min_value=5,
+        max_value=50,
+        value=10, # 預設從 50 降為 10
+        step=5
     )
 
     use_cache = st.checkbox("啟用相同問題快取", value=True)
